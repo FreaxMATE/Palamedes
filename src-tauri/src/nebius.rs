@@ -33,6 +33,10 @@ pub struct NebiusClient {
 }
 
 impl NebiusClient {
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let api_key = std::env::var("NEBIUS_API_KEY")
             .map_err(|_| anyhow::anyhow!("NEBIUS_API_KEY not set (check .env)"))?;
