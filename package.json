@@ -21,6 +21,8 @@
     "vite": "^8.0.4"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.10.1"
+    "@tauri-apps/api": "^2.10.1",
+    "highlight.js": "^11.11.1",
+    "marked": "^18.0.2"
   }
 }

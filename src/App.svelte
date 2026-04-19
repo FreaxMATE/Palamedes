@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { sendMessage, type ChatMessage, type StreamHandle } from "./lib/chat";
+  import Markdown from "./lib/Markdown.svelte";
 
   let messages: ChatMessage[] = $state([]);
   let input = $state("");
@@ -80,12 +81,20 @@
       {#each messages as msg, i (i)}
         <div class="flex {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
           <div
-            class="max-w-[75ch] rounded-lg px-4 py-2 whitespace-pre-wrap break-words
+            class="max-w-[75ch] rounded-lg px-4 py-2 break-words
                    {msg.role === 'user'
-                     ? 'bg-violet-500 text-white'
+                     ? 'bg-violet-500 text-white whitespace-pre-wrap'
                      : 'bg-neutral-100 dark:bg-neutral-800'}"
           >
-            {msg.content || (msg.role === "assistant" && streaming ? "…" : "")}
+            {#if msg.role === "assistant"}
+              {#if msg.content}
+                <Markdown source={msg.content} />
+              {:else if streaming}
+                <span class="text-neutral-500">…</span>
+              {/if}
+            {:else}
+              {msg.content}
+            {/if}
           </div>
         </div>
       {/each}
