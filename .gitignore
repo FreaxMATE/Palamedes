@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# direnv
+.direnv/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Node
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/schemas
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.swp
+*.suo
+
+# OS
+.DS_Store
