@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { fly } from "svelte/transition";
   import {
     createConversation,
     deleteConversation,
     deepestDescendant,
     getMessages,
     listConversations,
+    regenerate,
     sendMessage,
+    setBranchTitle,
     setCurrentLeaf,
     type Conversation,
     type Message,
@@ -15,18 +18,93 @@
   import Markdown from "./lib/Markdown.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import Settings from "./lib/Settings.svelte";
+  import TreePanel from "./lib/TreePanel.svelte";
+  import Audit from "./lib/Audit.svelte";
+  import Recap from "./lib/Recap.svelte";
+  import Capture from "./lib/Capture.svelte";
+  import ReceiptChips from "./lib/ReceiptChips.svelte";
+  import { ensureModels } from "./lib/modelStore";
 
   let conversations: Conversation[] = $state([]);
   let activeId: string | null = $state(null);
   let messages: Message[] = $state([]); // all messages in the active conversation
   let currentLeafId: string | null = $state(null);
   let input = $state("");
-  let asNewBranch = $state(false);
   let streaming: StreamHandle | null = $state(null);
-  let streamingAssistantContent = $state("");
+  let streamingMessageId: string | null = $state(null);
   let error: string | null = $state(null);
   let showSettings = $state(false);
+  let showTree = $state(false);
+  let showAudit = $state(false);
+  let showRecap = $state(false);
+  let showCapture = $state(false);
   let scrollEl: HTMLDivElement;
+  let textareaEl: HTMLTextAreaElement;
+  let scrollPositions = new Map<string, number>();
+  let copiedId: string | null = $state(null);
+  let editingTitleId: string | null = $state(null);
+  let editingTitleValue = $state("");
+  let editingMessageId: string | null = $state(null);
+  let editingMessageValue = $state("");
+
+  async function commitBranchTitle() {
+    if (!editingTitleId) return;
+    const id = editingTitleId;
+    const value = editingTitleValue.trim();
+    editingTitleId = null;
+    if (value) {
+      await setBranchTitle(id, value);
+      if (activeId) messages = await getMessages(activeId);
+    }
+  }
+
+  // --- Typewriter buffer: steady-rate char release for smooth rendering ---
+  let typewriterBuffer = "";
+  let typewriterTimer: number | null = null;
+  const TYPEWRITER_MS = 12; // ~80 chars/sec — tweakable
+
+  function appendToStreamingMessage(chunk: string) {
+    if (!streamingMessageId) return;
+    const idx = messages.findIndex((m) => m.id === streamingMessageId);
+    if (idx < 0) return;
+    messages[idx] = { ...messages[idx], content: messages[idx].content + chunk };
+  }
+
+  function onStreamDelta(delta: string) {
+    typewriterBuffer += delta;
+    if (typewriterTimer === null) {
+      typewriterTimer = window.setInterval(() => {
+        if (typewriterBuffer.length === 0) return;
+        const catchup = Math.max(1, Math.floor(typewriterBuffer.length / 40));
+        const toRelease = typewriterBuffer.slice(0, catchup);
+        typewriterBuffer = typewriterBuffer.slice(catchup);
+        appendToStreamingMessage(toRelease);
+      }, TYPEWRITER_MS);
+    }
+  }
+
+  function stopTypewriter() {
+    if (typewriterTimer !== null) {
+      window.clearInterval(typewriterTimer);
+      typewriterTimer = null;
+    }
+    if (typewriterBuffer.length > 0) {
+      appendToStreamingMessage(typewriterBuffer);
+      typewriterBuffer = "";
+    }
+  }
+
+  async function copyMessage(msg: Message) {
+    try {
+      await navigator.clipboard.writeText(msg.content);
+      copiedId = msg.id;
+      setTimeout(() => {
+        if (copiedId === msg.id) copiedId = null;
+      }, 1500);
+    } catch {
+      // clipboard blocked; ignore
+    }
+  }
 
   // ---------- path + sibling computation ----------
 
@@ -44,6 +122,21 @@
     return out.reverse();
   }
 
+  function relativeTime(iso: string): string {
+    const now = Date.now();
+    const then = new Date(iso).getTime();
+    const s = Math.round((now - then) / 1000);
+    if (s < 5) return "just now";
+    if (s < 60) return `${s}s ago`;
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m} min ago`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.round(h / 24);
+    if (d < 30) return `${d}d ago`;
+    return new Date(iso).toLocaleDateString();
+  }
+
   function siblingsOf(all: Message[], msg: Message): Message[] {
     return all
       .filter((m) => m.parent_id === msg.parent_id)
@@ -51,11 +144,47 @@
   }
 
   let currentPath = $derived(buildPath(messages, currentLeafId));
+  let currentPathIds = $derived(new Set(currentPath.map((m) => m.id)));
 
   // ---------- commands ----------
 
   onMount(async () => {
     await refreshConversations();
+    // Warm model-list cache in the background so Settings opens instantly.
+    ensureModels().catch(() => {});
+    textareaEl?.focus();
+
+    // Global keyboard shortcuts.
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key === "n") {
+        e.preventDefault();
+        newConversation();
+      } else if (mod && e.key === ",") {
+        e.preventDefault();
+        showSettings = !showSettings;
+      } else if (mod && e.key === "b") {
+        e.preventDefault();
+        if (activeId) showTree = !showTree;
+      } else if (mod && e.key === "m") {
+        e.preventDefault();
+        showAudit = !showAudit;
+      } else if (mod && e.key === "r") {
+        e.preventDefault();
+        showRecap = !showRecap;
+      } else if (mod && e.key === "i") {
+        e.preventDefault();
+        showCapture = !showCapture;
+      } else if (e.key === "Escape") {
+        if (showSettings) showSettings = false;
+        else if (showCapture) showCapture = false;
+        else if (showRecap) showRecap = false;
+        else if (showAudit) showAudit = false;
+        else if (showTree) showTree = false;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   });
 
   async function refreshConversations() {
@@ -64,23 +193,33 @@
 
   async function selectConversation(id: string) {
     if (streaming) return;
+    if (activeId && scrollEl) scrollPositions.set(activeId, scrollEl.scrollTop);
     activeId = id;
     messages = await getMessages(id);
     const conv = conversations.find((c) => c.id === id);
     currentLeafId = conv?.current_leaf_id ?? null;
-    // Fallback: if leaf is missing (shouldn't happen), pick newest message.
     if (!currentLeafId && messages.length > 0) {
       currentLeafId = messages[messages.length - 1].id;
     }
-    await scrollToBottom();
+    await tick();
+    const saved = scrollPositions.get(id);
+    if (saved !== undefined && scrollEl) {
+      scrollEl.scrollTop = saved;
+    } else {
+      scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior: "auto" });
+    }
+    textareaEl?.focus();
   }
 
   async function newConversation() {
     if (streaming) return;
+    if (activeId && scrollEl) scrollPositions.set(activeId, scrollEl.scrollTop);
     activeId = null;
     messages = [];
     currentLeafId = null;
     error = null;
+    await tick();
+    textareaEl?.focus();
   }
 
   async function onDelete(id: string) {
@@ -93,9 +232,13 @@
     await refreshConversations();
   }
 
-  async function scrollToBottom() {
+  function onScroll() {
+    if (activeId && scrollEl) scrollPositions.set(activeId, scrollEl.scrollTop);
+  }
+
+  async function scrollToBottom(behavior: "auto" | "smooth" = "auto") {
     await tick();
-    scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior: "smooth" });
+    scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior });
   }
 
   async function switchToMessage(messageId: string) {
@@ -115,50 +258,142 @@
     await scrollToBottom();
   }
 
-  async function send() {
+  async function runStream(handle: StreamHandle) {
+    streaming = handle;
+    try {
+      await handle.done;
+      stopTypewriter();
+      // Re-sync from DB. Since message IDs match our optimistic inserts,
+      // Svelte reconciles in place — no DOM recreation, no jump.
+      if (activeId) messages = await getMessages(activeId);
+      conversations = await listConversations();
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+      stopTypewriter();
+      if (activeId) messages = await getMessages(activeId);
+    } finally {
+      streaming = null;
+      streamingMessageId = null;
+      typewriterBuffer = "";
+      await tick();
+      textareaEl?.focus();
+    }
+  }
+
+  function autoResizeTextarea() {
+    if (!textareaEl) return;
+    textareaEl.style.height = "auto";
+    const max = 240; // ~10 rows
+    textareaEl.style.height = Math.min(textareaEl.scrollHeight, max) + "px";
+  }
+
+  async function regenerateMessage(msg: Message) {
+    if (streaming || msg.role !== "assistant" || !activeId || !msg.parent_id) return;
+    error = null;
+
+    const newAsstId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const optimistic: Message = {
+      id: newAsstId,
+      conversation_id: activeId,
+      parent_id: msg.parent_id,
+      role: "assistant",
+      content: "",
+      branch_title: null,
+      created_at: nowIso,
+      model: msg.model,
+      tokens_in: null,
+      tokens_out: null,
+      cost_micro_usd: null,
+    };
+    messages = [...messages, optimistic];
+    currentLeafId = newAsstId;
+    streamingMessageId = newAsstId;
+    await scrollToBottom();
+
+    const handle = regenerate(msg.id, newAsstId, onStreamDelta);
+    await runStream(handle);
+  }
+
+  function startEditingMessage(msg: Message) {
+    if (streaming) return;
+    editingMessageId = msg.id;
+    editingMessageValue = msg.content;
+  }
+
+  async function saveEditedMessage() {
+    if (!editingMessageId || !activeId) return;
+    const orig = messages.find((m) => m.id === editingMessageId);
+    const newContent = editingMessageValue.trim();
+    editingMessageId = null;
+    editingMessageValue = "";
+    if (!orig || orig.role !== "user" || !newContent || newContent === orig.content) return;
+
+    error = null;
+    await kickSend(activeId, orig.parent_id, newContent);
+  }
+
+  async function kickSend(convId: string, parentId: string | null, text: string) {
+    const userId = crypto.randomUUID();
+    const asstId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const userMsg: Message = {
+      id: userId,
+      conversation_id: convId,
+      parent_id: parentId,
+      role: "user",
+      content: text,
+      branch_title: null,
+      created_at: nowIso,
+      model: null,
+      tokens_in: null,
+      tokens_out: null,
+      cost_micro_usd: null,
+    };
+    const asstMsg: Message = {
+      id: asstId,
+      conversation_id: convId,
+      parent_id: userId,
+      role: "assistant",
+      content: "",
+      branch_title: null,
+      created_at: nowIso,
+      model: null,
+      tokens_in: null,
+      tokens_out: null,
+      cost_micro_usd: null,
+    };
+    messages = [...messages, userMsg, asstMsg];
+    currentLeafId = asstId;
+    streamingMessageId = asstId;
+    await scrollToBottom();
+
+    const handle = sendMessage(convId, parentId, userId, asstId, text, onStreamDelta);
+    await runStream(handle);
+  }
+
+  async function send(asNewBranch = false) {
     const text = input.trim();
     if (!text || streaming) return;
     input = "";
     error = null;
 
-    if (!activeId) {
+    let convId = activeId;
+    if (!convId) {
       const title = text.slice(0, 40).replace(/\n/g, " ") || "New chat";
       const conv = await createConversation(title);
+      convId = conv.id;
       activeId = conv.id;
       currentLeafId = null;
       await refreshConversations();
     }
 
-    // Determine parent for the new user message:
-    //   normal  → child of current leaf
-    //   branch  → sibling of current leaf (same parent_id)
     const leafMsg = currentPath.at(-1);
     const parentId = asNewBranch
       ? (leafMsg?.parent_id ?? null)
       : (leafMsg?.id ?? null);
 
-    streamingAssistantContent = "";
-    const handle = sendMessage(activeId!, parentId, text, (delta) => {
-      streamingAssistantContent += delta;
-      scrollToBottom();
-    });
-    streaming = handle;
-
-    try {
-      await handle.done;
-      messages = await getMessages(activeId!);
-      const conv = (await listConversations()).find((c) => c.id === activeId);
-      conversations = await listConversations();
-      currentLeafId = conv?.current_leaf_id ?? currentLeafId;
-    } catch (e: any) {
-      error = e?.message ?? String(e);
-      if (activeId) messages = await getMessages(activeId);
-    } finally {
-      streaming = null;
-      streamingAssistantContent = "";
-      asNewBranch = false;
-      await scrollToBottom();
-    }
+    await kickSend(convId, parentId, text);
   }
 
   async function cancel() {
@@ -168,7 +403,7 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      send();
+      send(e.ctrlKey || e.metaKey);
     }
   }
 </script>
@@ -184,11 +419,84 @@
   />
 
   <main class="flex-1 flex flex-col min-w-0">
-    <div bind:this={scrollEl} class="flex-1 overflow-y-auto p-6 space-y-4">
+    <div
+      class="border-b border-neutral-200 dark:border-neutral-800 px-4 py-2 flex justify-end gap-3"
+    >
+      <button
+        onclick={() => (showCapture = !showCapture)}
+        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        title="Capture a note (Ctrl+I)"
+      >
+        ✎ capture
+      </button>
+      <button
+        onclick={() => (showRecap = !showRecap)}
+        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        title="Toggle daily recap (Ctrl+R)"
+      >
+        📅 recap
+      </button>
+      <button
+        onclick={() => (showAudit = !showAudit)}
+        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        title="Toggle memory audit (Ctrl+M)"
+      >
+        🧠 memory
+      </button>
+      <button
+        onclick={() => (showTree = !showTree)}
+        disabled={!activeId}
+        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-30"
+        title="Toggle branch tree"
+      >
+        ⎇ branches
+      </button>
+    </div>
+    <div
+      bind:this={scrollEl}
+      onscroll={onScroll}
+      class="flex-1 overflow-y-auto p-6 space-y-4 scroll-smooth"
+    >
+      {#if !activeId && currentPath.length === 0}
+        <div
+          class="h-full flex items-center justify-center"
+          in:fly={{ y: 8, duration: 220 }}
+        >
+          <div class="text-center max-w-md">
+            <div class="text-4xl mb-3 opacity-70">⎇</div>
+            <h2 class="text-lg font-semibold mb-1">Start a new chat</h2>
+            <p class="text-sm text-neutral-500">
+              Type below and hit Enter. Branch any message with Ctrl+Enter
+              or the ↳ button.
+            </p>
+            <dl
+              class="mt-5 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs text-neutral-500 text-left"
+            >
+              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">N</kbd></dt>
+              <dd>New chat</dd>
+              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">,</kbd></dt>
+              <dd>Settings</dd>
+              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">B</kbd></dt>
+              <dd>Toggle branches panel</dd>
+              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">M</kbd></dt>
+              <dd>Toggle memory audit</dd>
+              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">R</kbd></dt>
+              <dd>Toggle daily recap</dd>
+              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">I</kbd></dt>
+              <dd>Capture a note</dd>
+              <dt>
+                <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">Enter</kbd>
+              </dt>
+              <dd>Send as new branch</dd>
+            </dl>
+          </div>
+        </div>
+      {/if}
       {#each currentPath as msg (msg.id)}
         {@const siblings = siblingsOf(messages, msg)}
         {@const idx = siblings.findIndex((s) => s.id === msg.id)}
         <div
+          in:fly={{ y: 6, duration: 180 }}
           class="group flex {msg.role === 'user'
             ? 'justify-end'
             : 'justify-start'}"
@@ -200,8 +508,51 @@
                        ? 'bg-violet-500 text-white whitespace-pre-wrap'
                        : 'bg-neutral-100 dark:bg-neutral-800'}"
             >
-              {#if msg.role === "assistant"}
-                <Markdown source={msg.content} />
+              {#if editingMessageId === msg.id}
+                <textarea
+                  bind:value={editingMessageValue}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                      e.preventDefault();
+                      saveEditedMessage();
+                    } else if (e.key === "Escape") {
+                      editingMessageId = null;
+                    }
+                  }}
+                  class="w-full bg-transparent border-0 resize-y min-h-[6em] focus:outline-none text-white placeholder-white/60"
+                  rows="4"
+                ></textarea>
+                <div class="flex gap-2 mt-1 text-xs">
+                  <button
+                    onclick={saveEditedMessage}
+                    class="rounded bg-white/20 hover:bg-white/30 px-2 py-0.5"
+                  >
+                    Save (⌘↵)
+                  </button>
+                  <button
+                    onclick={() => (editingMessageId = null)}
+                    class="rounded hover:bg-white/20 px-2 py-0.5"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              {:else if msg.role === "assistant"}
+                {#if msg.content}
+                  <Markdown
+                    source={msg.content}
+                    throttle={streamingMessageId === msg.id}
+                  />
+                {:else if streamingMessageId === msg.id}
+                  <span class="typing-dots" aria-label="Thinking">
+                    <span></span><span></span><span></span>
+                  </span>
+                {/if}
+                {#if streamingMessageId !== msg.id && msg.content}
+                  <ReceiptChips
+                    turnId={msg.id}
+                    onOpenAudit={() => (showAudit = true)}
+                  />
+                {/if}
               {:else}
                 {msg.content}
               {/if}
@@ -235,33 +586,77 @@
                 >
                   ›
                 </button>
+                {#if editingTitleId === msg.id}
+                  <!-- svelte-ignore a11y_autofocus -->
+                  <input
+                    type="text"
+                    bind:value={editingTitleValue}
+                    onblur={commitBranchTitle}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter") { e.preventDefault(); commitBranchTitle(); }
+                      else if (e.key === "Escape") { editingTitleId = null; }
+                    }}
+                    class="bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0 text-xs focus:outline-none focus:ring-1 focus:ring-violet-500"
+                    autofocus
+                  />
+                {:else if msg.branch_title}
+                  <button
+                    ondblclick={() => {
+                      editingTitleId = msg.id;
+                      editingTitleValue = msg.branch_title ?? "";
+                    }}
+                    class="italic hover:text-neutral-900 dark:hover:text-neutral-100 truncate max-w-[20ch]"
+                    title="Double-click to rename"
+                  >
+                    {msg.branch_title}
+                  </button>
+                {/if}
               {/if}
+              <span
+                class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 tabular-nums"
+                title={new Date(msg.created_at).toLocaleString()}
+              >
+                {relativeTime(msg.created_at)}
+              </span>
               <button
                 onclick={() => branchFromHere(msg.id)}
-                class="opacity-0 group-hover:opacity-100 hover:text-violet-500"
+                class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-violet-500"
                 disabled={!!streaming}
                 title="Next message will branch from here"
               >
                 ↳ branch
               </button>
+              {#if msg.role === "user"}
+                <button
+                  onclick={() => startEditingMessage(msg)}
+                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-violet-500"
+                  disabled={!!streaming}
+                  title="Edit message (creates sibling branch)"
+                >
+                  ✎ edit
+                </button>
+              {/if}
+              {#if msg.role === "assistant"}
+                <button
+                  onclick={() => regenerateMessage(msg)}
+                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-violet-500"
+                  disabled={!!streaming}
+                  title="Regenerate (creates sibling with same history)"
+                >
+                  ↻ retry
+                </button>
+                <button
+                  onclick={() => copyMessage(msg)}
+                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-neutral-900 dark:hover:text-neutral-100"
+                  title="Copy"
+                >
+                  {copiedId === msg.id ? "copied" : "copy"}
+                </button>
+              {/if}
             </div>
           </div>
         </div>
       {/each}
-
-      {#if streaming}
-        <div class="flex justify-start">
-          <div
-            class="max-w-[75ch] rounded-lg px-4 py-2 break-words bg-neutral-100 dark:bg-neutral-800"
-          >
-            {#if streamingAssistantContent}
-              <Markdown source={streamingAssistantContent} />
-            {:else}
-              <span class="text-neutral-500">…</span>
-            {/if}
-          </div>
-        </div>
-      {/if}
 
       {#if error}
         <div class="text-sm text-red-500">Error: {error}</div>
@@ -269,40 +664,75 @@
     </div>
 
     <div
-      class="border-t border-neutral-200 dark:border-neutral-800 p-4 flex flex-col gap-2"
+      class="border-t border-neutral-200 dark:border-neutral-800 p-4 flex gap-2 items-stretch"
     >
-      <label class="flex items-center gap-2 text-xs text-neutral-500 cursor-pointer select-none">
-        <input type="checkbox" bind:checked={asNewBranch} disabled={!!streaming} />
-        Send as new branch (sibling of current leaf)
-      </label>
-      <div class="flex gap-2 items-end">
-        <textarea
-          bind:value={input}
-          onkeydown={onKeydown}
-          disabled={!!streaming}
-          class="flex-1 resize-none rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-50"
-          rows="3"
-          placeholder="Message Palamedes… (Enter to send, Shift+Enter for newline)"
-        ></textarea>
-        {#if streaming}
+      <textarea
+        bind:this={textareaEl}
+        bind:value={input}
+        oninput={autoResizeTextarea}
+        onkeydown={onKeydown}
+        disabled={!!streaming}
+        class="flex-1 resize-none rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-50 transition-all"
+        rows="2"
+        style="min-height: 2.75rem; max-height: 15rem;"
+        placeholder="Message Palamedes… (Enter to send, Shift+Enter for newline, Ctrl+Enter for branch)"
+      ></textarea>
+
+      {#if streaming}
+        <button
+          onclick={cancel}
+          class="rounded-md bg-red-500 hover:bg-red-600 text-white px-4 text-sm font-medium self-stretch"
+        >
+          Stop
+        </button>
+      {:else}
+        <div class="flex flex-col gap-1 w-36">
           <button
-            onclick={cancel}
-            class="rounded-md bg-red-500 hover:bg-red-600 text-white px-4 py-2 text-sm font-medium"
-          >
-            Stop
-          </button>
-        {:else}
-          <button
-            onclick={send}
+            onclick={() => send(true)}
             disabled={!input.trim()}
-            class="rounded-md bg-violet-500 hover:bg-violet-600 disabled:opacity-50 text-white px-4 py-2 text-sm font-medium"
+            title="Send as new branch (Ctrl+Enter) — creates a sibling of the current leaf"
+            class="flex-1 rounded-md border border-violet-400/60 bg-white dark:bg-neutral-900 text-violet-600 dark:text-violet-300
+                   hover:bg-violet-50 dark:hover:bg-violet-950 disabled:opacity-40
+                   px-3 text-xs font-medium inline-flex items-center justify-center gap-1"
+          >
+            <span>↳</span>
+            <span>new branch</span>
+          </button>
+          <button
+            onclick={() => send(false)}
+            disabled={!input.trim()}
+            title="Send (Enter)"
+            class="flex-1 rounded-md bg-violet-500 hover:bg-violet-600 disabled:opacity-40
+                   text-white px-3 text-sm font-medium"
           >
             Send
           </button>
-        {/if}
-      </div>
+        </div>
+      {/if}
     </div>
   </main>
+
+  {#if showTree && activeId}
+    <TreePanel
+      {messages}
+      {currentPathIds}
+      {currentLeafId}
+      onSelect={switchToMessage}
+      onClose={() => (showTree = false)}
+    />
+  {/if}
+
+  {#if showAudit}
+    <Audit onClose={() => (showAudit = false)} />
+  {/if}
+
+  {#if showRecap}
+    <Recap onClose={() => (showRecap = false)} />
+  {/if}
+
+  {#if showCapture}
+    <Capture onClose={() => (showCapture = false)} />
+  {/if}
 </div>
 
 {#if showSettings}

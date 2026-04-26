@@ -1,97 +1,90 @@
 <script lang="ts">
   import { marked } from "marked";
   import hljs from "highlight.js";
-  import "highlight.js/styles/github-dark.css";
+  import { onDestroy } from "svelte";
 
   interface Props {
     source: string;
+    /** When true, re-parse is throttled — useful during streaming. */
+    throttle?: boolean;
   }
 
-  let { source }: Props = $props();
+  let { source, throttle = false }: Props = $props();
 
-  marked.setOptions({
-    breaks: true,
-    gfm: true,
-  });
+  marked.setOptions({ breaks: true, gfm: true });
 
-  // Custom renderer for code blocks with highlight.js
   const renderer = new marked.Renderer();
   renderer.code = ({ text, lang }) => {
     const language = lang && hljs.getLanguage(lang) ? lang : "plaintext";
     const highlighted = hljs.highlight(text, { language }).value;
-    return `<pre class="rounded-md overflow-x-auto my-2 p-3 bg-neutral-900 text-sm"><code class="hljs language-${language}">${highlighted}</code></pre>`;
+    const encoded = encodeURIComponent(text);
+    return (
+      `<div class="code-block relative group">` +
+      `<pre class="rounded-md overflow-x-auto my-2 p-3 pr-12 bg-neutral-900 text-sm">` +
+      `<code class="hljs language-${language}">${highlighted}</code>` +
+      `</pre>` +
+      `<button type="button" data-copy-code="${encoded}" ` +
+      `class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity duration-150 ` +
+      `rounded bg-neutral-800/80 hover:bg-neutral-700 text-neutral-200 text-[10px] px-2 py-0.5 uppercase tracking-wide">` +
+      `copy</button>` +
+      `</div>`
+    );
   };
 
-  let html = $derived(marked.parse(source, { renderer }) as string);
+  function parse(s: string): string {
+    return marked.parse(s, { renderer }) as string;
+  }
+
+  let html = $state(parse(source));
+  let lastParse = 0;
+  let pending: number | null = null;
+
+  $effect(() => {
+    const current = source;
+    if (!throttle) {
+      html = parse(current);
+      return;
+    }
+    const now = performance.now();
+    const elapsed = now - lastParse;
+    const MIN_INTERVAL = 60;
+    if (elapsed >= MIN_INTERVAL) {
+      html = parse(current);
+      lastParse = now;
+    } else if (pending === null) {
+      pending = window.setTimeout(() => {
+        pending = null;
+        html = parse(source);
+        lastParse = performance.now();
+      }, MIN_INTERVAL - elapsed);
+    }
+  });
+
+  onDestroy(() => {
+    if (pending !== null) window.clearTimeout(pending);
+  });
+
+  async function onClick(e: MouseEvent) {
+    const target = (e.target as HTMLElement).closest(
+      "[data-copy-code]",
+    ) as HTMLElement | null;
+    if (!target) return;
+    const raw = target.getAttribute("data-copy-code") ?? "";
+    try {
+      await navigator.clipboard.writeText(decodeURIComponent(raw));
+      const original = target.textContent;
+      target.textContent = "copied";
+      setTimeout(() => {
+        if (target.textContent === "copied") target.textContent = original ?? "copy";
+      }, 1200);
+    } catch {
+      /* ignore */
+    }
+  }
 </script>
 
-<div class="prose-chat">
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="prose-chat" onclick={onClick}>
   {@html html}
 </div>
-
-<style>
-  .prose-chat :global(p) {
-    margin: 0.25rem 0;
-  }
-  .prose-chat :global(p:first-child) {
-    margin-top: 0;
-  }
-  .prose-chat :global(p:last-child) {
-    margin-bottom: 0;
-  }
-  .prose-chat :global(ul),
-  .prose-chat :global(ol) {
-    margin: 0.25rem 0;
-    padding-left: 1.5rem;
-  }
-  .prose-chat :global(li) {
-    margin: 0.125rem 0;
-  }
-  .prose-chat :global(code) {
-    background: rgba(127, 127, 127, 0.2);
-    padding: 0.1em 0.35em;
-    border-radius: 3px;
-    font-size: 0.9em;
-  }
-  .prose-chat :global(pre code) {
-    background: transparent;
-    padding: 0;
-    border-radius: 0;
-    font-size: inherit;
-  }
-  .prose-chat :global(h1),
-  .prose-chat :global(h2),
-  .prose-chat :global(h3) {
-    font-weight: 600;
-    margin: 0.75rem 0 0.25rem;
-  }
-  .prose-chat :global(h1) {
-    font-size: 1.2rem;
-  }
-  .prose-chat :global(h2) {
-    font-size: 1.1rem;
-  }
-  .prose-chat :global(h3) {
-    font-size: 1.05rem;
-  }
-  .prose-chat :global(blockquote) {
-    border-left: 3px solid rgba(127, 127, 127, 0.4);
-    padding-left: 0.75rem;
-    margin: 0.5rem 0;
-    color: inherit;
-    opacity: 0.85;
-  }
-  .prose-chat :global(a) {
-    color: rgb(139, 92, 246);
-    text-decoration: underline;
-  }
-  .prose-chat :global(table) {
-    border-collapse: collapse;
-    margin: 0.5rem 0;
-  }
-  .prose-chat :global(th),
-  .prose-chat :global(td) {
-    border: 1px solid rgba(127, 127, 127, 0.4);
-    padding: 0.25rem 0.5rem;
-  }
-</style>

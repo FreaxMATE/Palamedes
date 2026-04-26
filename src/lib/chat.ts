@@ -64,6 +64,9 @@ export const getMessages = (conversationId: string) =>
 export const setCurrentLeaf = (conversationId: string, leafId: string | null) =>
   invoke<void>("set_current_leaf", { conversationId, leafId });
 
+export const setBranchTitle = (messageId: string, title: string) =>
+  invoke<void>("set_branch_title", { messageId, title });
+
 export const deepestDescendant = (messageId: string) =>
   invoke<string>("deepest_descendant", { messageId });
 
@@ -73,12 +76,145 @@ export const getSetting = (key: string) =>
 export const setSetting = (key: string, value: string) =>
   invoke<void>("set_setting", { key, value });
 
+export const listModels = () => invoke<string[]>("list_models");
+
+// ---------- Belief Ledger / audit ----------
+
+export type BeliefStatus =
+  | "asserted"
+  | "inferred"
+  | "corrected"
+  | "contested"
+  | "expired"
+  | "blocked";
+
+export type TrustClass = "asserted" | "inferred" | "hypothesized" | "summary";
+
+export interface AuditBelief {
+  id: string;
+  statement: string;
+  confidence: number;
+  category: string | null;
+  status: BeliefStatus;
+  trust_class: TrustClass;
+  level: number;
+  parent_summary_id: string | null;
+  provenance_count: number;
+  version_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProvenanceItem {
+  source_type: "turn" | "artifact" | "belief";
+  source_id: string;
+  relation:
+    | "extracted_from"
+    | "reinforced_by"
+    | "contradicted_by"
+    | "corrected_by"
+    | "summarizes";
+  preview: string | null;
+  created_at: string;
+}
+
+export interface VersionItem {
+  version_num: number;
+  statement: string;
+  confidence: number;
+  reason: string | null;
+  editor: "user" | "ai" | "system";
+  created_at: string;
+  provenance: ProvenanceItem[];
+}
+
+export interface BeliefDetail {
+  belief: AuditBelief;
+  versions: VersionItem[];
+}
+
+export interface UpdateBeliefArgs {
+  id: string;
+  newStatus?: BeliefStatus;
+  newTrustClass?: TrustClass;
+  newStatement?: string;
+  newConfidence?: number;
+  reason?: string;
+  blocklistPattern?: string;
+}
+
+export const listBeliefsAudit = () => invoke<AuditBelief[]>("list_beliefs_audit");
+
+export const getBeliefDetail = (id: string) =>
+  invoke<BeliefDetail>("get_belief_detail", { id });
+
+export const updateBelief = (args: UpdateBeliefArgs) =>
+  invoke<void>("update_belief", { args });
+
+export interface SummarizeReport {
+  categories_processed: number;
+  summaries_created: number;
+  beliefs_covered: number;
+  overlaps_dropped: number;
+  hallucinations_dropped: number;
+  errors: string[];
+}
+
+export const summarizeNow = () => invoke<SummarizeReport>("summarize_now");
+
+export interface EmbedReport {
+  embedded: number;
+  failed: number;
+  first_error: string | null;
+  model: string;
+}
+
+export const embedUnembeddedBeliefs = () =>
+  invoke<EmbedReport>("embed_unembedded_beliefs");
+
+export interface ReceiptItem {
+  belief_id: string;
+  statement: string;
+  trust_class: TrustClass;
+  status: BeliefStatus;
+  weight: number;
+  rank: number;
+}
+
+export const getReceiptsForTurn = (turnId: string) =>
+  invoke<ReceiptItem[]>("get_receipts_for_turn", { turnId });
+
+export interface RecapResponse {
+  date: string;
+  path: string;
+  markdown: string;
+}
+
+export const generateRecap = (dateIso?: string) =>
+  invoke<RecapResponse>("generate_recap", { dateIso: dateIso ?? null });
+
+export const listRecaps = () => invoke<string[]>("list_recaps");
+
+export interface Artifact {
+  id: string;
+  kind: "note" | "clip" | "file" | "voice";
+  title: string | null;
+  content: string | null;
+  source_url: string | null;
+  created_at: string;
+}
+
+export const captureNote = (content: string) =>
+  invoke<Artifact>("capture_note", { content });
+
+export const listArtifacts = () => invoke<Artifact[]>("list_artifacts");
+
 // ---------- streaming ----------
 
-export function sendMessage(
-  conversationId: string,
-  parentId: string | null,
-  userContent: string,
+type InvokeCall = [command: string, args: Record<string, unknown>];
+
+function startStream(
+  [command, args]: InvokeCall,
   onDelta: (text: string) => void,
 ): StreamHandle {
   const streamId = crypto.randomUUID();
@@ -120,12 +256,7 @@ export function sendMessage(
     );
 
     try {
-      await invoke<void>("send_message", {
-        streamId,
-        conversationId,
-        parentId,
-        userContent,
-      });
+      await invoke<void>(command, { streamId, ...args });
     } catch (err) {
       cleanup();
       rejectDone(err);
@@ -139,4 +270,38 @@ export function sendMessage(
       await invoke("cancel_stream", { streamId });
     },
   };
+}
+
+export function sendMessage(
+  conversationId: string,
+  parentId: string | null,
+  userMessageId: string,
+  assistantMessageId: string,
+  userContent: string,
+  onDelta: (text: string) => void,
+): StreamHandle {
+  return startStream(
+    [
+      "send_message",
+      {
+        conversationId,
+        parentId,
+        userMessageId,
+        assistantMessageId,
+        userContent,
+      },
+    ],
+    onDelta,
+  );
+}
+
+export function regenerate(
+  assistantMessageId: string,
+  newAssistantMessageId: string,
+  onDelta: (text: string) => void,
+): StreamHandle {
+  return startStream(
+    ["regenerate", { assistantMessageId, newAssistantMessageId }],
+    onDelta,
+  );
 }
