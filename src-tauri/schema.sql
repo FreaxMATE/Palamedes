@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS beliefs (
     level              INTEGER NOT NULL DEFAULT 0,
     parent_summary_id  TEXT REFERENCES beliefs(id),
 
+    -- Short keyword label (1-4 words) for the memory map. Generated async
+    -- after the belief lands. NULL until the labeler runs; the UI falls
+    -- back to a truncated statement when missing.
+    label              TEXT,
+
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL,
     last_reinforced_at TEXT
@@ -186,3 +191,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_beliefs USING vec0(
     belief_id TEXT PRIMARY KEY,
     embedding FLOAT[4096]
 );
+
+-- ============================================================================
+-- 2D projection cache for the memory map.
+-- One row per belief whose embedding has been projected. Stale rows (where
+-- projection_version < the table-wide current version) are tolerated; the
+-- frontend re-projects when too many beliefs lack positions. The position
+-- range is conventionally [-1, 1] after the renderer normalizes.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS belief_positions (
+    belief_id          TEXT PRIMARY KEY REFERENCES beliefs(id) ON DELETE CASCADE,
+    x                  REAL NOT NULL,
+    y                  REAL NOT NULL,
+    projection_version INTEGER NOT NULL,
+    created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_belief_positions_version ON belief_positions(projection_version);

@@ -29,6 +29,10 @@ interface StreamChunk {
   stream_id: string;
   delta: string;
 }
+interface StreamReasoning {
+  stream_id: string;
+  delta: string;
+}
 interface StreamDone {
   stream_id: string;
   message_id: string;
@@ -54,6 +58,10 @@ export const createConversation = (title: string) =>
 
 export const deleteConversation = (id: string) =>
   invoke<void>("delete_conversation", { id });
+
+export const wipeChats = () => invoke<void>("wipe_chats");
+
+export const wipeAllData = () => invoke<void>("wipe_all_data");
 
 export const renameConversation = (id: string, title: string) =>
   invoke<void>("rename_conversation", { id, title });
@@ -101,6 +109,7 @@ export interface AuditBelief {
   parent_summary_id: string | null;
   provenance_count: number;
   version_count: number;
+  reinforced_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -172,6 +181,16 @@ export interface EmbedReport {
 export const embedUnembeddedBeliefs = () =>
   invoke<EmbedReport>("embed_unembedded_beliefs");
 
+export interface LabelBackfillReport {
+  labeled: number;
+  failed: number;
+  first_error: string | null;
+  model: string;
+}
+
+export const regenerateBeliefLabels = () =>
+  invoke<LabelBackfillReport>("regenerate_belief_labels");
+
 export interface ReceiptItem {
   belief_id: string;
   statement: string;
@@ -195,19 +214,108 @@ export const generateRecap = (dateIso?: string) =>
 
 export const listRecaps = () => invoke<string[]>("list_recaps");
 
-export interface Artifact {
-  id: string;
-  kind: "note" | "clip" | "file" | "voice";
-  title: string | null;
-  content: string | null;
-  source_url: string | null;
-  created_at: string;
+export const nameCluster = (statements: string[]) =>
+  invoke<string>("name_cluster", { statements });
+
+export interface MergeCandidate {
+  a_id: string;
+  a_statement: string;
+  a_status: BeliefStatus;
+  a_trust_class: TrustClass;
+  a_confidence: number;
+  b_id: string;
+  b_statement: string;
+  b_status: BeliefStatus;
+  b_trust_class: TrustClass;
+  b_confidence: number;
+  cosine: number;
+  tier: "definite" | "likely";
 }
 
-export const captureNote = (content: string) =>
-  invoke<Artifact>("capture_note", { content });
+export const listMergeCandidates = () =>
+  invoke<MergeCandidate[]>("list_merge_candidates");
 
-export const listArtifacts = () => invoke<Artifact[]>("list_artifacts");
+export interface MergeBeliefsArgs {
+  keeperId: string;
+  absorbedId: string;
+  reason?: string;
+}
+
+export const mergeBeliefs = (args: MergeBeliefsArgs) =>
+  invoke<void>("merge_beliefs", { args });
+
+// ---------- memory map ----------
+
+export interface GraphBelief {
+  id: string;
+  statement: string;
+  label: string | null;
+  category: string | null;
+  status: BeliefStatus;
+  trust_class: TrustClass;
+  level: number;
+  parent_summary_id: string | null;
+  confidence: number;
+  reinforced_count: number;
+  created_at: string;
+  last_reinforced_at: string | null;
+  x: number | null;
+  y: number | null;
+  has_embedding: boolean;
+}
+
+export type GraphEdgeKind =
+  | "hierarchy"
+  | "summarizes"
+  | "reinforced_by"
+  | "contradicted_by"
+  | "corrected_by"
+  | "extracted_from"
+  | "knn"
+  | "co_recall";
+
+export interface GraphEdge {
+  source_id: string;
+  target_id: string;
+  kind: GraphEdgeKind;
+  weight: number;
+}
+
+export interface GraphSnapshot {
+  beliefs: GraphBelief[];
+  edges: GraphEdge[];
+  projection_version: number;
+}
+
+export const getGraphSnapshot = () => invoke<GraphSnapshot>("get_graph_snapshot");
+
+export const getGraphEdgesExtended = (knnK?: number) =>
+  invoke<GraphEdge[]>("get_graph_edges_extended", { knnK: knnK ?? 3 });
+
+export interface TurnForBelief {
+  turn_id: string;
+  conversation_id: string;
+  conversation_title: string;
+  preview: string;
+  created_at: string;
+  weight: number;
+  rank: number;
+}
+
+export const getTurnsForBelief = (beliefId: string) =>
+  invoke<TurnForBelief[]>("get_turns_for_belief", { beliefId });
+
+export const getBeliefEmbeddings = (beliefIds: string[]) =>
+  invoke<Array<[string, number[]]>>("get_belief_embeddings", { beliefIds });
+
+export interface PositionUpdate {
+  belief_id: string;
+  x: number;
+  y: number;
+}
+
+export const saveBeliefPositions = (positions: PositionUpdate[]) =>
+  invoke<number>("save_belief_positions", { positions });
 
 // ---------- streaming ----------
 
@@ -216,6 +324,7 @@ type InvokeCall = [command: string, args: Record<string, unknown>];
 function startStream(
   [command, args]: InvokeCall,
   onDelta: (text: string) => void,
+  onReasoning?: (text: string) => void,
 ): StreamHandle {
   const streamId = crypto.randomUUID();
 
@@ -238,6 +347,13 @@ function startStream(
         if (e.payload.stream_id === streamId) onDelta(e.payload.delta);
       }),
     );
+    if (onReasoning) {
+      unlisteners.push(
+        await listen<StreamReasoning>("stream_reasoning", (e) => {
+          if (e.payload.stream_id === streamId) onReasoning(e.payload.delta);
+        }),
+      );
+    }
     unlisteners.push(
       await listen<StreamDone>("stream_done", (e) => {
         if (e.payload.stream_id === streamId) {
@@ -279,6 +395,7 @@ export function sendMessage(
   assistantMessageId: string,
   userContent: string,
   onDelta: (text: string) => void,
+  onReasoning?: (text: string) => void,
 ): StreamHandle {
   return startStream(
     [
@@ -292,6 +409,7 @@ export function sendMessage(
       },
     ],
     onDelta,
+    onReasoning,
   );
 }
 
@@ -299,9 +417,11 @@ export function regenerate(
   assistantMessageId: string,
   newAssistantMessageId: string,
   onDelta: (text: string) => void,
+  onReasoning?: (text: string) => void,
 ): StreamHandle {
   return startStream(
     ["regenerate", { assistantMessageId, newAssistantMessageId }],
     onDelta,
+    onReasoning,
   );
 }

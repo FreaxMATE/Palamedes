@@ -6,16 +6,22 @@
     updateBelief,
     summarizeNow,
     embedUnembeddedBeliefs,
+    listMergeCandidates,
+    mergeBeliefs,
     type AuditBelief,
     type BeliefDetail,
     type BeliefStatus,
     type TrustClass,
+    type MergeCandidate,
   } from "./chat";
 
   interface Props {
     onClose: () => void;
+    /** If set, expand and scroll this belief into view on first load. Used by
+     *  receipt-chip click-through from the chat panel. */
+    targetBelief?: string | null;
   }
-  let { onClose }: Props = $props();
+  let { onClose, targetBelief = null }: Props = $props();
 
   let beliefs: AuditBelief[] = $state([]);
   let loading = $state(true);
@@ -25,7 +31,47 @@
   let busy = $state(false);
   let summarizing = $state(false);
   let summarizeMessage: string | null = $state(null);
-  let embedding = $state(false);
+
+  // Merge candidates panel
+  let showMerges = $state(false);
+  let mergeLoading = $state(false);
+  let candidates: MergeCandidate[] = $state([]);
+  let mergingPair: string | null = $state(null);
+
+  async function loadCandidates() {
+    mergeLoading = true;
+    try {
+      candidates = await listMergeCandidates();
+    } catch (e) {
+      summarizeMessage = `Merge scan failed: ${e}`;
+    } finally {
+      mergeLoading = false;
+    }
+  }
+
+  async function toggleMerges() {
+    showMerges = !showMerges;
+    if (showMerges && candidates.length === 0) {
+      await loadCandidates();
+    }
+  }
+
+  async function applyMerge(c: MergeCandidate, keepA: boolean) {
+    const pairKey = `${c.a_id}:${c.b_id}`;
+    mergingPair = pairKey;
+    try {
+      await mergeBeliefs({
+        keeperId: keepA ? c.a_id : c.b_id,
+        absorbedId: keepA ? c.b_id : c.a_id,
+      });
+      await refresh();
+      await loadCandidates();
+    } catch (e) {
+      summarizeMessage = `Merge failed: ${e}`;
+    } finally {
+      mergingPair = null;
+    }
+  }
 
   // Filters
   type StatusFilter = "active" | "all" | BeliefStatus;
@@ -41,6 +87,18 @@
   let refinedStatement = $state("");
   let alsoBlock = $state(false);
 
+  // UI: collapsed toolbar overflow + filter disclosure + per-row extra actions.
+  let toolsOpen = $state(false);
+  let filtersOpen = $state(false);
+  let extrasFor: string | null = $state(null);
+
+  let activeFilterCount = $derived(
+    (statusFilter !== "active" ? 1 : 0) +
+      (trustFilter !== "all" ? 1 : 0) +
+      (categoryFilter !== "all" ? 1 : 0) +
+      (sortBy !== "recency" ? 1 : 0),
+  );
+
   async function refresh() {
     loading = true;
     try {
@@ -50,7 +108,48 @@
     }
   }
 
-  onMount(refresh);
+  onMount(async () => {
+    await refresh();
+    // Silent embed-backfill: if any belief lacks a vector, embed it in the
+    // background. Idempotent — does nothing when all beliefs are embedded,
+    // so it's safe to run every panel-mount.
+    embedUnembeddedBeliefs().catch(() => {
+      // Network/Nebius hiccup — don't surface; user can retry from ⋯ menu later.
+    });
+    // Silent merge scan: surfaces a count in the ⋯ menu when near-duplicates
+    // exist, so the user notices without us nagging them in the chat.
+    listMergeCandidates()
+      .then((cs) => { candidates = cs; })
+      .catch(() => {});
+    if (targetBelief) await jumpToBelief(targetBelief);
+  });
+
+  // React to a new target belief landing while the panel is already open
+  // (e.g. user clicked a receipt chip on a different turn).
+  $effect(() => {
+    if (!targetBelief) return;
+    if (loading) return;
+    jumpToBelief(targetBelief);
+  });
+
+  async function jumpToBelief(id: string) {
+    if (!beliefs.find((b) => b.id === id)) return;
+    // Make sure inactive-status filters don't hide the row we're jumping to.
+    const target = beliefs.find((b) => b.id === id);
+    if (target && (target.status === "expired" || target.status === "blocked")) {
+      statusFilter = "all";
+    }
+    if (expandedId !== id) await toggleExpand(id);
+    // Wait for the row + its expanded detail to render, then scroll.
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-belief-id="${id}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.add("belief-flash");
+        setTimeout(() => el.classList.remove("belief-flash"), 1500);
+      }
+    });
+  }
 
   let categories = $derived.by(() => {
     const s = new Set<string>();
@@ -174,22 +273,6 @@
     }
   }
 
-  async function runEmbed() {
-    embedding = true;
-    summarizeMessage = null;
-    try {
-      const r = await embedUnembeddedBeliefs();
-      const parts = [`${r.embedded} embedded`];
-      if (r.failed > 0) parts.push(`${r.failed} failed`);
-      if (r.first_error) parts.push(`[${r.model}] ${r.first_error}`);
-      summarizeMessage = parts.join(" · ");
-    } catch (e) {
-      summarizeMessage = `Embed failed: ${e}`;
-    } finally {
-      embedding = false;
-    }
-  }
-
   async function runSummarize() {
     summarizing = true;
     summarizeMessage = null;
@@ -291,38 +374,58 @@
         What the AI thinks about you
       </p>
     </div>
-    <div class="flex items-center gap-2">
-      <button
-        onclick={runEmbed}
-        disabled={embedding}
-        class="text-[11px] px-2 py-0.5 rounded border border-cyan-300 dark:border-cyan-800 text-cyan-700 dark:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-950 disabled:opacity-50"
-        title="Embed any beliefs that don't yet have a vector (backfill)"
-      >
-        {embedding ? "Embedding…" : "⌁ Embed"}
-      </button>
-      <button
-        onclick={runSummarize}
-        disabled={summarizing}
-        class="text-[11px] px-2 py-0.5 rounded border border-violet-300 dark:border-violet-800 text-violet-700 dark:text-violet-400 hover:bg-violet-50 dark:hover:bg-violet-950 disabled:opacity-50"
-        title="Cluster + summarize unsummarized beliefs"
-      >
-        {summarizing ? "Summarizing…" : "Σ Summarize"}
-      </button>
+    <div class="flex items-center gap-1 relative">
       <button
         onclick={refresh}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        class="text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 px-1.5 py-0.5"
         title="Refresh"
         aria-label="Refresh"
       >
         ↻
       </button>
       <button
+        onclick={() => (toolsOpen = !toolsOpen)}
+        class="text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 px-1.5 py-0.5"
+        title="Tools"
+        aria-label="Tools"
+        aria-expanded={toolsOpen}
+      >
+        ⋯
+      </button>
+      <button
         onclick={onClose}
-        class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 px-1.5 py-0.5"
         aria-label="Close"
       >
         ×
       </button>
+
+      {#if toolsOpen}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="absolute right-0 top-full mt-1 z-20 w-52 rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-lg py-1 text-sm"
+          onclick={(e) => e.stopPropagation()}
+        >
+          <button
+            onclick={() => { toolsOpen = false; runSummarize(); }}
+            disabled={summarizing}
+            class="w-full text-left px-3 py-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+          >
+            {summarizing ? "Σ Summarizing…" : "Σ Summarize now"}
+          </button>
+          <button
+            onclick={() => { toolsOpen = false; toggleMerges(); }}
+            class="w-full text-left px-3 py-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 flex items-center justify-between"
+          >
+            <span>{showMerges ? "⇌ Close merges" : "⇌ Find merges"}</span>
+            {#if !showMerges && candidates.length > 0}
+              <span class="text-[10px] px-1.5 py-0.5 rounded-full pal-accent-soft-bg pal-accent-text">
+                {candidates.length}
+              </span>
+            {/if}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -334,64 +437,152 @@
     </div>
   {/if}
 
-  <!-- Filters -->
-  <div class="px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 space-y-2">
-    <div class="flex items-center gap-1 flex-wrap">
-      {#each ["active", "all", "asserted", "inferred", "corrected", "contested", "expired", "blocked"] as s (s)}
-        <button
-          class="text-[11px] px-2 py-0.5 rounded-full border
-                 {statusFilter === s
-            ? 'bg-violet-500 text-white border-violet-500'
-            : 'border-neutral-300 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:border-violet-400'}"
-          onclick={() => (statusFilter = s as StatusFilter)}
-        >
-          {s}
-        </button>
-      {/each}
-    </div>
-    <div class="flex items-center gap-2 text-[11px] text-neutral-500">
-      <label>
-        trust:
-        <select
-          class="ml-1 bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
-          bind:value={trustFilter}
-        >
-          <option value="all">all</option>
-          <option value="asserted">🔒 asserted</option>
-          <option value="inferred">🧠 inferred</option>
-          <option value="hypothesized">❓ hypothesized</option>
-          <option value="summary">Σ summary</option>
-        </select>
-      </label>
-      <label>
-        cat:
-        <select
-          class="ml-1 bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
-          bind:value={categoryFilter}
-        >
-          <option value="all">all</option>
-          {#each categories as c (c)}
-            <option value={c}>{c}</option>
+  <!-- Filter disclosure: collapsed by default. Active filters visible as a count. -->
+  <div class="px-3 py-2 border-b border-neutral-200 dark:border-neutral-800">
+    <button
+      type="button"
+      onclick={() => (filtersOpen = !filtersOpen)}
+      class="w-full flex items-center justify-between text-[11px] text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+    >
+      <span class="inline-flex items-center gap-1">
+        <span class="inline-block transition-transform {filtersOpen ? 'rotate-90' : ''}">›</span>
+        Filter{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ""}
+      </span>
+      <span class="tabular-nums">{visible.length} / {beliefs.length}</span>
+    </button>
+
+    {#if filtersOpen}
+      <div class="mt-2 space-y-2">
+        <div class="flex items-center gap-1 flex-wrap">
+          {#each ["active", "all", "asserted", "inferred", "corrected", "contested", "expired", "blocked"] as s (s)}
+            <button
+              class="text-[11px] px-2 py-0.5 rounded-full border
+                     {statusFilter === s
+                ? 'pal-accent-bg text-white pal-accent-border'
+                : 'border-neutral-300 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:pal-accent-border'}"
+              onclick={() => (statusFilter = s as StatusFilter)}
+            >
+              {s}
+            </button>
           {/each}
-        </select>
-      </label>
-      <label>
-        sort:
-        <select
-          class="ml-1 bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
-          bind:value={sortBy}
-        >
-          <option value="recency">recency</option>
-          <option value="confidence">confidence</option>
-        </select>
-      </label>
-      <span class="ml-auto">{visible.length} / {beliefs.length}</span>
-    </div>
+        </div>
+        <div class="flex items-center gap-2 text-[11px] text-neutral-500">
+          <label>
+            trust:
+            <select
+              class="ml-1 bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
+              bind:value={trustFilter}
+            >
+              <option value="all">all</option>
+              <option value="asserted">🔒 asserted</option>
+              <option value="inferred">🧠 inferred</option>
+              <option value="hypothesized">❓ hypothesized</option>
+              <option value="summary">Σ summary</option>
+            </select>
+          </label>
+          <label>
+            cat:
+            <select
+              class="ml-1 bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
+              bind:value={categoryFilter}
+            >
+              <option value="all">all</option>
+              {#each categories as c (c)}
+                <option value={c}>{c}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="ml-auto">
+            sort:
+            <select
+              class="ml-1 bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
+              bind:value={sortBy}
+            >
+              <option value="recency">recency</option>
+              <option value="confidence">confidence</option>
+            </select>
+          </label>
+        </div>
+      </div>
+    {/if}
   </div>
 
   <!-- List -->
   <div class="flex-1 overflow-y-auto">
-    {#if loading}
+    {#if showMerges}
+      <div class="px-3 pt-2 pb-1 flex items-center justify-between text-[11px] text-neutral-500">
+        <span>
+          {mergeLoading ? "Scanning…" : `${candidates.length} candidate pair(s)`}
+        </span>
+        <button
+          onclick={loadCandidates}
+          disabled={mergeLoading}
+          class="hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-50"
+          title="Re-scan"
+        >
+          ↻
+        </button>
+      </div>
+      {#if !mergeLoading && candidates.length === 0}
+        <p class="p-4 text-sm text-neutral-500">
+          No near-duplicates found. Lower
+          <code>dedup_suggest_threshold</code> in Settings to surface looser
+          matches.
+        </p>
+      {/if}
+      <ul class="divide-y divide-neutral-200 dark:divide-neutral-800">
+        {#each candidates as c (c.a_id + c.b_id)}
+          {@const pairKey = `${c.a_id}:${c.b_id}`}
+          {@const busy = mergingPair === pairKey}
+          <li class="px-3 py-3 space-y-2">
+            <div class="flex items-center gap-2 text-[11px]">
+              <span
+                class="px-1.5 py-px rounded {c.tier === 'definite'
+                  ? 'bg-rose-100 dark:bg-rose-950 text-rose-800 dark:text-rose-300'
+                  : 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300'}"
+              >
+                {c.tier}
+              </span>
+              <span class="font-mono text-neutral-500">cos {c.cosine.toFixed(3)}</span>
+            </div>
+            <div class="grid grid-cols-1 gap-2">
+              <div
+                class="p-2 rounded border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900"
+              >
+                <p class="text-sm">{c.a_statement}</p>
+                <p class="text-[10px] text-neutral-500 mt-0.5">
+                  {c.a_status} · conf {c.a_confidence.toFixed(2)}
+                </p>
+                <button
+                  class="mt-1.5 text-[11px] px-2 py-0.5 rounded pal-accent-bg text-white hover:opacity-90 disabled:opacity-50"
+                  disabled={busy}
+                  onclick={() => applyMerge(c, true)}
+                  title="Keep this; absorb the other"
+                >
+                  Keep this ↓
+                </button>
+              </div>
+              <div
+                class="p-2 rounded border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900"
+              >
+                <p class="text-sm">{c.b_statement}</p>
+                <p class="text-[10px] text-neutral-500 mt-0.5">
+                  {c.b_status} · conf {c.b_confidence.toFixed(2)}
+                </p>
+                <button
+                  class="mt-1.5 text-[11px] px-2 py-0.5 rounded pal-accent-bg text-white hover:opacity-90 disabled:opacity-50"
+                  disabled={busy}
+                  onclick={() => applyMerge(c, false)}
+                  title="Keep this; absorb the other"
+                >
+                  Keep this ↑
+                </button>
+              </div>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {:else if loading}
       <p class="p-4 text-sm text-neutral-500">Loading…</p>
     {:else if visible.length === 0}
       <p class="p-4 text-sm text-neutral-500">
@@ -402,6 +593,7 @@
         {#each visible as b (b.id)}
           {@const isSummary = b.trust_class === "summary"}
           <li
+            data-belief-id={b.id}
             class="px-3 py-2.5 {isSummary
               ? 'bg-violet-50/40 dark:bg-violet-950/20 border-l-2 border-violet-400 dark:border-violet-700'
               : ''}"
@@ -443,6 +635,14 @@
                   {#if b.version_count > 1}
                     <span>· v{b.version_count}</span>
                   {/if}
+                  {#if b.reinforced_count > 0}
+                    <span
+                      class="px-1.5 py-px rounded bg-cyan-100 dark:bg-cyan-950 text-cyan-800 dark:text-cyan-300"
+                      title="Reinforced by later turns via dedup"
+                    >
+                      🔗 {b.reinforced_count}×
+                    </span>
+                  {/if}
                 </span>
               </span>
               <span class="text-neutral-400 text-xs">{expandedId === b.id ? "▾" : "▸"}</span>
@@ -476,10 +676,10 @@
                   {/if}
                 {/if}
 
-                <!-- Action buttons -->
-                <div class="flex items-center gap-1 flex-wrap mb-3">
+                <!-- Primary actions: confirm / wrong. Everything else lives behind ⋯. -->
+                <div class="flex items-center gap-1 mb-3">
                   <button
-                    class="text-xs px-2 py-1 rounded border border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950 disabled:opacity-50"
+                    class="text-xs px-2.5 py-1 rounded border border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950 disabled:opacity-50"
                     disabled={busy}
                     onclick={() => correct(b.id)}
                     title="Confirm correct — promotes to asserted"
@@ -487,35 +687,47 @@
                     ✓ correct
                   </button>
                   <button
-                    class="text-xs px-2 py-1 rounded border border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950 disabled:opacity-50"
+                    class="text-xs px-2.5 py-1 rounded border border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950 disabled:opacity-50"
                     disabled={busy}
                     onclick={() => startAction(b.id, "wrong")}
                   >
                     ✗ wrong
                   </button>
                   <button
-                    class="text-xs px-2 py-1 rounded border border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950 disabled:opacity-50"
-                    disabled={busy}
-                    onclick={() => startAction(b.id, "partial")}
+                    class="text-xs px-2 py-1 rounded text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-900 ml-auto"
+                    onclick={() => (extrasFor = extrasFor === b.id ? null : b.id)}
+                    title="More actions"
+                    aria-label="More actions"
                   >
-                    ~ partial
-                  </button>
-                  <button
-                    class="text-xs px-2 py-1 rounded border border-violet-300 dark:border-violet-800 text-violet-700 dark:text-violet-400 hover:bg-violet-50 dark:hover:bg-violet-950 disabled:opacity-50"
-                    disabled={busy}
-                    onclick={() => pin(b.id)}
-                    title="Pin — locks as user-asserted"
-                  >
-                    📌 pin
-                  </button>
-                  <button
-                    class="text-xs px-2 py-1 rounded border border-neutral-300 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-900 disabled:opacity-50"
-                    disabled={busy}
-                    onclick={() => startAction(b.id, "forget")}
-                  >
-                    🗑 forget
+                    ⋯
                   </button>
                 </div>
+                {#if extrasFor === b.id}
+                  <div class="flex items-center gap-1 flex-wrap mb-3 pl-1">
+                    <button
+                      class="text-xs px-2 py-1 rounded border border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950 disabled:opacity-50"
+                      disabled={busy}
+                      onclick={() => { extrasFor = null; startAction(b.id, "partial"); }}
+                    >
+                      ~ partial
+                    </button>
+                    <button
+                      class="text-xs px-2 py-1 rounded border pal-accent-border pal-accent-text hover:pal-accent-soft-bg disabled:opacity-50"
+                      disabled={busy}
+                      onclick={() => { extrasFor = null; pin(b.id); }}
+                      title="Pin — locks as user-asserted"
+                    >
+                      📌 pin
+                    </button>
+                    <button
+                      class="text-xs px-2 py-1 rounded border border-neutral-300 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-900 disabled:opacity-50"
+                      disabled={busy}
+                      onclick={() => { extrasFor = null; startAction(b.id, "forget"); }}
+                    >
+                      🗑 forget
+                    </button>
+                  </div>
+                {/if}
 
                 <!-- Inline action form -->
                 {#if actionFor === b.id && actionKind}
@@ -560,7 +772,7 @@
                         Cancel
                       </button>
                       <button
-                        class="text-xs px-2 py-1 rounded bg-violet-500 text-white hover:bg-violet-600 disabled:opacity-50"
+                        class="text-xs px-2 py-1 rounded pal-accent-bg text-white hover:opacity-90 disabled:opacity-50"
                         onclick={applyAction}
                         disabled={busy}
                       >

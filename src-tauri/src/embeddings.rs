@@ -18,6 +18,34 @@ pub const EMBEDDING_DIM: usize = 4096;
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = "Qwen/Qwen3-Embedding-8B";
 
+/// Cosine threshold above which two L2-normalized vectors are treated as
+/// the same belief by the extraction-time dedup check. 0.85 catches
+/// paraphrases (e.g. "User's name is Konstantin" vs "The user's name is
+/// Konstantin Unruh") without merging distinct-but-related claims.
+/// Tunable via the `dedup_cosine_threshold` setting.
+pub const DEFAULT_DEDUP_COSINE_THRESHOLD: f64 = 0.85;
+
+/// Lower bound for "review me" merge candidates surfaced in the audit panel.
+/// Pairs in [SUGGEST, DEDUP) are presented for manual review; pairs >= DEDUP
+/// are flagged as "definite" (and would have auto-merged at extraction time
+/// if both were new). Tunable via the `dedup_suggest_threshold` setting.
+pub const DEFAULT_SUGGEST_COSINE_THRESHOLD: f64 = 0.70;
+
+/// Minimum cosine for a retrieved belief to actually land in the chat
+/// system prompt. Below this we treat the match as noise and drop it
+/// entirely. Calibrated from 2026-05-06 dogfood data: off-topic queries
+/// (Rust code, Python code) maxed out at ~0.22 cosine; genuinely relevant
+/// matches sat in 0.30–0.78. 0.35 keeps the signal, kills the noise.
+/// Tunable via the `retrieval_min_cosine` setting.
+pub const DEFAULT_RETRIEVAL_MIN_COSINE: f64 = 0.35;
+
+/// Cosine similarity from sqlite-vec's L2 distance between unit vectors.
+/// For unit vectors: d² = 2(1 - cos), so cos = 1 - d²/2.
+/// Returns a value in [-1, 1].
+pub fn cosine_from_l2(distance: f64) -> f64 {
+    1.0 - (distance * distance) / 2.0
+}
+
 static INIT: Once = Once::new();
 
 /// Register sqlite-vec as an auto-extension so every new SQLite connection
@@ -101,5 +129,15 @@ mod tests {
     fn blob_rejects_wrong_dim() {
         let v = vec![0.0_f32; 10];
         assert!(vec_to_blob(&v).is_err());
+    }
+
+    #[test]
+    fn cosine_from_l2_endpoints() {
+        // Identical unit vectors → distance 0 → cosine 1.
+        assert!((cosine_from_l2(0.0) - 1.0).abs() < 1e-9);
+        // Orthogonal unit vectors → d² = 2 → d = sqrt(2) → cosine 0.
+        assert!((cosine_from_l2((2.0_f64).sqrt()) - 0.0).abs() < 1e-9);
+        // Opposite unit vectors → d² = 4 → d = 2 → cosine -1.
+        assert!((cosine_from_l2(2.0) - (-1.0)).abs() < 1e-9);
     }
 }

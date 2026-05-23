@@ -30,3 +30,8 @@ src-tauri/gen/schemas
 
 # OS
 .DS_Store
+
+# Internal planning / scratch — not for the public repo
+docs/ROADMAP.md
+docs/MAP_PLAN.md
+.claude/

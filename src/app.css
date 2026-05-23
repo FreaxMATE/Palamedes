@@ -1,11 +1,65 @@
 @import "tailwindcss";
 @import "highlight.js/styles/github-dark.css";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Light-mode palette defaults — palettes only override dark for the
+     launch demo. Light mode stays calm-neutral across all palettes. */
+  --pal-bg: #fafafa;
+  --pal-surface: #ffffff;
+  --pal-ink: #171717;
+  --pal-dim: #737373;
+  --pal-border: #e5e5e5;
+  --pal-accent: 139 92 246;        /* violet-500 */
+  --pal-accent-soft: rgba(139, 92, 246, 0.12);
+}
+
+.dark {
+  color-scheme: dark;
+  /* "default" dark — current look, neutral-950 ground. */
+  --pal-bg: #0a0a0a;
+  --pal-surface: #171717;
+  --pal-ink: #f5f5f5;
+  --pal-dim: #a3a3a3;
+  --pal-border: #262626;
+  --pal-accent: 139 92 246;
+  --pal-accent-soft: rgba(139, 92, 246, 0.18);
+}
+
+.dark[data-palette="audit-dark"] {
+  --pal-bg: #0a0a0c;
+  --pal-surface: #15151a;
+  --pal-ink: #e8e6e1;
+  --pal-dim: #7a7a82;
+  --pal-border: #232328;
+  --pal-accent: 167 139 250;      /* #a78bfa violet-400 */
+  --pal-accent-soft: rgba(167, 139, 250, 0.16);
+}
+
+.dark[data-palette="inkwell"] {
+  --pal-bg: #0e0e10;
+  --pal-surface: #18181c;
+  --pal-ink: #f4ecd8;             /* warm paper */
+  --pal-dim: #8a847a;
+  --pal-border: #2a2823;
+  --pal-accent: 212 165 116;      /* #d4a574 parchment */
+  --pal-accent-soft: rgba(212, 165, 116, 0.16);
+}
+
+.dark[data-palette="atrium"] {
+  --pal-bg: #101214;
+  --pal-surface: #171a1c;
+  --pal-ink: #e4e4e7;
+  --pal-dim: #6e7178;
+  --pal-border: #25282c;
+  --pal-accent: 103 232 179;      /* #67e8b3 mint */
+  --pal-accent-soft: rgba(103, 232, 179, 0.14);
 }
 
 html, body, #app {
@@ -14,8 +68,20 @@ html, body, #app {
 }
 
 body {
-  @apply bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100;
+  background: var(--pal-bg);
+  color: var(--pal-ink);
 }
+
+/* Reusable palette-aware surfaces. Components opt in by class instead of
+   sprinkling Tailwind neutrals so a palette swap doesn't require touching
+   every component. */
+.pal-surface { background: var(--pal-surface); }
+.pal-border { border-color: var(--pal-border); }
+.pal-dim { color: var(--pal-dim); }
+.pal-accent-bg { background: rgb(var(--pal-accent)); }
+.pal-accent-text { color: rgb(var(--pal-accent)); }
+.pal-accent-border { border-color: rgb(var(--pal-accent)); }
+.pal-accent-soft-bg { background: var(--pal-accent-soft); }
 
 /* Keyboard shortcut badge */
 .kbd {
@@ -84,11 +150,89 @@ body {
   opacity: 0.85;
 }
 .prose-chat a {
-  color: rgb(139, 92, 246);
+  color: rgb(var(--pal-accent));
   text-decoration: underline;
 }
 .prose-chat table { border-collapse: collapse; margin: 0.5rem 0; }
 .prose-chat th, .prose-chat td {
   border: 1px solid rgba(127, 127, 127, 0.4);
   padding: 0.25rem 0.5rem;
+}
+
+/* Brief highlight when scrolling to a specific belief from a receipt chip. */
+.belief-flash {
+  animation: belief-flash 1.5s ease-out;
+}
+@keyframes belief-flash {
+  0%   { background-color: rgb(var(--pal-accent) / 0.32); }
+  100% { background-color: transparent; }
+}
+
+/* Reasoning summary: hide the native disclosure marker so we control the
+   layout fully. The cursor + hover state is the affordance to expand. */
+.reasoning-summary {
+  list-style: none;
+}
+.reasoning-summary::-webkit-details-marker { display: none; }
+.reasoning-summary::marker { display: none; }
+
+/* Live single-line tail of the chain-of-thought, rendered next to the
+   "Thinking…" label. Truncates with an ellipsis once it overflows the
+   bubble width. flex-1 + min-width: 0 is the trick that lets a flex
+   child shrink below its content size so text-overflow can engage. */
+.reasoning-tail {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-style: italic;
+  font-weight: 400;
+  opacity: 0.55;
+}
+
+/* Reasoning stream window: auto-tailing live preview with a top fade so
+   the cut-off feels intentional. Mimics Gemini Pro's "Thinking…" panel. */
+.reasoning-stream-window {
+  --reasoning-fade: 14px;
+  position: relative;
+  max-height: 6.5rem;
+  overflow: hidden;
+}
+.reasoning-stream-body {
+  max-height: 6.5rem;
+  overflow-y: auto;
+  scrollbar-width: none;
+  /* Top fade-out via mask so the latest tokens are bright and what
+     scrolled past dissolves into the bubble background. */
+  -webkit-mask-image: linear-gradient(to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.2) var(--reasoning-fade),
+    black calc(var(--reasoning-fade) * 2),
+    black 100%);
+          mask-image: linear-gradient(to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.2) var(--reasoning-fade),
+    black calc(var(--reasoning-fade) * 2),
+    black 100%);
+}
+.reasoning-stream-body::-webkit-scrollbar { display: none; }
+
+/* Subtle shimmer on the "Thinking…" label while reasoning is streaming. */
+.thinking-shimmer {
+  background: linear-gradient(90deg,
+    currentColor 0%,
+    currentColor 40%,
+    rgb(var(--pal-accent) / 0.9) 50%,
+    currentColor 60%,
+    currentColor 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+          background-clip: text;
+  color: transparent;
+  animation: thinking-shimmer 2.4s linear infinite;
+}
+@keyframes thinking-shimmer {
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
 }

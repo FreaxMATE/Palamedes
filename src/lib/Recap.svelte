@@ -8,10 +8,11 @@
   }
   let { onClose }: Props = $props();
 
-  let recap: RecapResponse | null = $state(null);
-  let dates: string[] = $state([]);
+  let recap = $state<RecapResponse | null>(null);
+  let dates = $state<string[]>([]);
   let loading = $state(false);
-  let error: string | null = $state(null);
+  let error = $state<string | null>(null);
+  let showOlder = $state(false);
 
   function todayLocal(): string {
     const d = new Date();
@@ -20,6 +21,20 @@
     const day = String(d.getDate()).padStart(2, "0");
     return `${y}-${m}-${day}`;
   }
+
+  function yesterdayLocal(): string {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+
+  let activeDate = $derived(recap?.date ?? todayLocal());
+  let olderDates = $derived(
+    dates.filter((d) => d !== todayLocal() && d !== yesterdayLocal()),
+  );
 
   async function load(date?: string) {
     loading = true;
@@ -38,60 +53,85 @@
 </script>
 
 <aside
-  class="w-[520px] shrink-0 border-l border-neutral-200 dark:border-neutral-800 flex flex-col bg-neutral-50 dark:bg-neutral-950"
+  class="w-[520px] shrink-0 border-l border-neutral-200 dark:border-neutral-800 flex flex-col"
+  style="background: var(--pal-surface);"
 >
   <div
-    class="px-4 py-3 border-b border-neutral-200 dark:border-neutral-800 flex items-center justify-between"
+    class="px-5 pt-4 pb-3 border-b border-neutral-200 dark:border-neutral-800 flex items-center justify-between"
   >
-    <div>
-      <h2 class="text-sm font-semibold tracking-tight">Daily recap</h2>
-      <p class="text-[11px] text-neutral-500 mt-0.5">
-        What you did today + what the AI inferred
-      </p>
-    </div>
-    <div class="flex items-center gap-2">
-      <select
-        class="text-[11px] bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0.5"
-        value={recap?.date ?? todayLocal()}
-        onchange={(e) => load((e.target as HTMLSelectElement).value)}
-      >
-        {#if !dates.includes(todayLocal())}
-          <option value={todayLocal()}>{todayLocal()} (today)</option>
+    <h2 class="text-base font-semibold tracking-tight">
+      Today, in your AI's eyes
+    </h2>
+    <button
+      onclick={onClose}
+      class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 text-lg leading-none"
+      aria-label="Close"
+    >
+      ×
+    </button>
+  </div>
+
+  <!-- Day selector: today / yesterday + optional older. -->
+  <div class="px-5 py-2 flex items-center gap-1 text-xs border-b border-neutral-200 dark:border-neutral-800">
+    <button
+      onclick={() => load(todayLocal())}
+      class="px-2 py-0.5 rounded {activeDate === todayLocal()
+        ? 'pal-accent-text font-medium'
+        : 'text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100'}"
+    >
+      Today
+    </button>
+    <button
+      onclick={() => load(yesterdayLocal())}
+      class="px-2 py-0.5 rounded {activeDate === yesterdayLocal()
+        ? 'pal-accent-text font-medium'
+        : 'text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100'}"
+    >
+      Yesterday
+    </button>
+    {#if olderDates.length > 0}
+      <div class="relative">
+        <button
+          onclick={() => (showOlder = !showOlder)}
+          class="px-2 py-0.5 rounded text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        >
+          Earlier ▾
+        </button>
+        {#if showOlder}
+          <div
+            class="absolute left-0 top-full mt-1 z-20 w-40 max-h-64 overflow-y-auto rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-lg py-1"
+          >
+            {#each olderDates as d (d)}
+              <button
+                onclick={() => { showOlder = false; load(d); }}
+                class="w-full text-left px-3 py-1 text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800 {activeDate === d ? 'pal-accent-text' : ''}"
+              >
+                {d}
+              </button>
+            {/each}
+          </div>
         {/if}
-        {#each dates as d (d)}
-          <option value={d}>{d}{d === todayLocal() ? " (today)" : ""}</option>
-        {/each}
-      </select>
-      <button
-        onclick={() => load(recap?.date)}
-        disabled={loading}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-50"
-        title="Regenerate"
-        aria-label="Regenerate"
-      >
-        ↻
-      </button>
-      <button
-        onclick={onClose}
-        class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
-        aria-label="Close"
-      >
-        ×
-      </button>
-    </div>
+      </div>
+    {/if}
+    <button
+      onclick={() => load(activeDate)}
+      disabled={loading}
+      class="ml-auto text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-50"
+      title="Regenerate"
+      aria-label="Regenerate"
+    >
+      ↻
+    </button>
   </div>
 
   <div class="flex-1 overflow-y-auto">
     {#if loading && !recap}
-      <p class="p-4 text-sm text-neutral-500">Loading…</p>
+      <p class="px-5 py-6 text-sm text-neutral-500">Loading…</p>
     {:else if error}
-      <p class="p-4 text-sm text-rose-500">Failed: {error}</p>
+      <p class="px-5 py-6 text-sm text-rose-500">Failed: {error}</p>
     {:else if recap}
-      <div class="p-4">
+      <div class="px-6 py-5 prose-chat text-[15px] leading-relaxed">
         <Markdown source={recap.markdown} />
-        <p class="mt-6 text-[11px] text-neutral-400 break-all">
-          Saved to <code>{recap.path}</code>
-        </p>
       </div>
     {/if}
   </div>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { fly } from "svelte/transition";
+  import { fade, fly } from "svelte/transition";
   import {
     createConversation,
     deleteConversation,
@@ -21,9 +21,10 @@
   import TreePanel from "./lib/TreePanel.svelte";
   import Audit from "./lib/Audit.svelte";
   import Recap from "./lib/Recap.svelte";
-  import Capture from "./lib/Capture.svelte";
+  import Graph from "./lib/Graph.svelte";
   import ReceiptChips from "./lib/ReceiptChips.svelte";
   import { ensureModels } from "./lib/modelStore";
+  import { themeState } from "./lib/theme.svelte";
 
   let conversations: Conversation[] = $state([]);
   let activeId: string | null = $state(null);
@@ -32,12 +33,36 @@
   let input = $state("");
   let streaming: StreamHandle | null = $state(null);
   let streamingMessageId: string | null = $state(null);
+  // Ephemeral chain-of-thought for the most recent stream. Cleared whenever
+  // a new stream starts; the panel collapses when content begins arriving.
+  // `reasoningMessageId` outlives `streamingMessageId` so the collapsed
+  // "Thought for Xs" panel stays attached to its assistant message after
+  // the reply finishes.
+  let reasoningText = $state("");
+  let reasoningMessageId: string | null = $state(null);
+  let reasoningStartMs: number | null = $state(null);
+  let reasoningElapsedMs: number | null = $state(null);
+  // Collapsed by default — the shimmer label + inline tail are enough
+  // signal. Click the summary to peek at the full live stream.
+  let reasoningOpen = $state(false);
+  let reasoningBodyEl: HTMLDivElement | undefined = $state();
+
+  // Last ~200 chars of the reasoning, whitespace collapsed. Rendered
+  // inline next to "Thinking…" as a live single-line ticker.
+  let reasoningTail = $derived(
+    reasoningText.length === 0
+      ? ""
+      : reasoningText.slice(-200).replace(/\s+/g, " ").trim(),
+  );
   let error: string | null = $state(null);
   let showSettings = $state(false);
   let showTree = $state(false);
   let showAudit = $state(false);
+  // When a receipt chip is clicked, the audit panel opens scrolled to this
+  // belief. Cleared after the audit panel acts on it (one-shot per click).
+  let auditTargetBelief: string | null = $state(null);
   let showRecap = $state(false);
-  let showCapture = $state(false);
+  let showGraph = $state(false);
   let scrollEl: HTMLDivElement;
   let textareaEl: HTMLTextAreaElement;
   let scrollPositions = new Map<string, number>();
@@ -71,6 +96,17 @@
   }
 
   function onStreamDelta(delta: string) {
+    // First content chunk after reasoning: freeze the elapsed counter so
+    // the "Thought for Xs" label stops ticking. Independent of whether
+    // the panel is open or closed.
+    if (
+      reasoningText.length > 0 &&
+      reasoningElapsedMs === null &&
+      reasoningStartMs !== null &&
+      messages.find((m) => m.id === streamingMessageId)?.content === ""
+    ) {
+      reasoningElapsedMs = Date.now() - reasoningStartMs;
+    }
     typewriterBuffer += delta;
     if (typewriterTimer === null) {
       typewriterTimer = window.setInterval(() => {
@@ -81,6 +117,31 @@
         appendToStreamingMessage(toRelease);
       }, TYPEWRITER_MS);
     }
+  }
+
+  function onStreamReasoning(delta: string) {
+    if (reasoningText.length === 0) {
+      reasoningStartMs = Date.now();
+      reasoningMessageId = streamingMessageId;
+    }
+    reasoningText += delta;
+    // Auto-tail only when the user has the panel open (peeking at the
+    // live stream). Defer until after Svelte flushes the DOM.
+    if (reasoningOpen) {
+      queueMicrotask(() => {
+        if (reasoningBodyEl) {
+          reasoningBodyEl.scrollTop = reasoningBodyEl.scrollHeight;
+        }
+      });
+    }
+  }
+
+  function resetReasoning() {
+    reasoningText = "";
+    reasoningMessageId = null;
+    reasoningStartMs = null;
+    reasoningElapsedMs = null;
+    reasoningOpen = false;
   }
 
   function stopTypewriter() {
@@ -148,11 +209,37 @@
 
   // ---------- commands ----------
 
-  onMount(async () => {
-    await refreshConversations();
-    // Warm model-list cache in the background so Settings opens instantly.
+  // Recap auto-open: once per local day, slide the recap panel in so the
+  // user sees yesterday's inferences without having to remember the shortcut.
+  // Tracked in localStorage; manual Ctrl+R still works.
+  const RECAP_SEEN_KEY = "palamedes-recap-seen-date";
+
+  function todayLocalIso(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  function maybeAutoOpenRecap() {
+    try {
+      const seen = localStorage.getItem(RECAP_SEEN_KEY);
+      const today = todayLocalIso();
+      if (seen !== today) {
+        showRecap = true;
+        localStorage.setItem(RECAP_SEEN_KEY, today);
+      }
+    } catch {
+      // localStorage may be unavailable; quietly skip.
+    }
+  }
+
+  onMount(() => {
+    // Fire-and-forget the async bootstrap so we can still return a sync
+    // cleanup for the keydown listener (Svelte/Tauri requires onMount's
+    // return to be the disposer, not a Promise).
+    refreshConversations();
     ensureModels().catch(() => {});
     textareaEl?.focus();
+    maybeAutoOpenRecap();
 
     // Global keyboard shortcuts.
     const onKey = (e: KeyboardEvent) => {
@@ -172,12 +259,12 @@
       } else if (mod && e.key === "r") {
         e.preventDefault();
         showRecap = !showRecap;
-      } else if (mod && e.key === "i") {
+      } else if (mod && e.key === "g") {
         e.preventDefault();
-        showCapture = !showCapture;
+        showGraph = !showGraph;
       } else if (e.key === "Escape") {
         if (showSettings) showSettings = false;
-        else if (showCapture) showCapture = false;
+        else if (showGraph) showGraph = false;
         else if (showRecap) showRecap = false;
         else if (showAudit) showAudit = false;
         else if (showTree) showTree = false;
@@ -311,7 +398,8 @@
     streamingMessageId = newAsstId;
     await scrollToBottom();
 
-    const handle = regenerate(msg.id, newAsstId, onStreamDelta);
+    resetReasoning();
+    const handle = regenerate(msg.id, newAsstId, onStreamDelta, onStreamReasoning);
     await runStream(handle);
   }
 
@@ -368,7 +456,8 @@
     streamingMessageId = asstId;
     await scrollToBottom();
 
-    const handle = sendMessage(convId, parentId, userId, asstId, text, onStreamDelta);
+    resetReasoning();
+    const handle = sendMessage(convId, parentId, userId, asstId, text, onStreamDelta, onStreamReasoning);
     await runStream(handle);
   }
 
@@ -420,36 +509,36 @@
 
   <main class="flex-1 flex flex-col min-w-0">
     <div
-      class="border-b border-neutral-200 dark:border-neutral-800 px-4 py-2 flex justify-end gap-3"
+      class="border-b border-neutral-200 dark:border-neutral-800 px-4 py-2 flex justify-end gap-4"
     >
-      <button
-        onclick={() => (showCapture = !showCapture)}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
-        title="Capture a note (Ctrl+I)"
-      >
-        ✎ capture
-      </button>
-      <button
-        onclick={() => (showRecap = !showRecap)}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
-        title="Toggle daily recap (Ctrl+R)"
-      >
-        📅 recap
-      </button>
       <button
         onclick={() => (showAudit = !showAudit)}
         class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
-        title="Toggle memory audit (Ctrl+M)"
+        title="Audit what the AI thinks about you (Ctrl+M)"
       >
         🧠 memory
+      </button>
+      <button
+        onclick={() => (showGraph = !showGraph)}
+        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        title="Memory map (Ctrl+G)"
+      >
+        ✦ map
       </button>
       <button
         onclick={() => (showTree = !showTree)}
         disabled={!activeId}
         class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-30"
-        title="Toggle branch tree"
+        title="Branches (Ctrl+B)"
       >
         ⎇ branches
+      </button>
+      <button
+        onclick={() => themeState.toggle()}
+        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        title={themeState.current === "dark" ? "Switch to light" : "Switch to dark"}
+      >
+        {themeState.current === "dark" ? "☀" : "☾"}
       </button>
     </div>
     <div
@@ -462,33 +551,15 @@
           class="h-full flex items-center justify-center"
           in:fly={{ y: 8, duration: 220 }}
         >
-          <div class="text-center max-w-md">
-            <div class="text-4xl mb-3 opacity-70">⎇</div>
-            <h2 class="text-lg font-semibold mb-1">Start a new chat</h2>
-            <p class="text-sm text-neutral-500">
-              Type below and hit Enter. Branch any message with Ctrl+Enter
-              or the ↳ button.
+          <div class="text-center max-w-md px-6">
+            <h2 class="text-2xl font-semibold mb-3 tracking-tight">
+              Chat normally.
+            </h2>
+            <p class="text-sm text-neutral-500 leading-relaxed">
+              I'll keep notes on what I learn about you — confidence and all.
+              Press <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">M</kbd>
+              any time to audit what's in there.
             </p>
-            <dl
-              class="mt-5 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs text-neutral-500 text-left"
-            >
-              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">N</kbd></dt>
-              <dd>New chat</dd>
-              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">,</kbd></dt>
-              <dd>Settings</dd>
-              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">B</kbd></dt>
-              <dd>Toggle branches panel</dd>
-              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">M</kbd></dt>
-              <dd>Toggle memory audit</dd>
-              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">R</kbd></dt>
-              <dd>Toggle daily recap</dd>
-              <dt><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">I</kbd></dt>
-              <dd>Capture a note</dd>
-              <dt>
-                <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">Enter</kbd>
-              </dt>
-              <dd>Send as new branch</dd>
-            </dl>
           </div>
         </div>
       {/if}
@@ -505,7 +576,7 @@
             <div
               class="rounded-lg px-4 py-2 break-words
                      {msg.role === 'user'
-                       ? 'bg-violet-500 text-white whitespace-pre-wrap'
+                       ? 'pal-accent-bg text-white whitespace-pre-wrap'
                        : 'bg-neutral-100 dark:bg-neutral-800'}"
             >
               {#if editingMessageId === msg.id}
@@ -537,20 +608,60 @@
                   </button>
                 </div>
               {:else if msg.role === "assistant"}
+                {@const isThinking = streamingMessageId === msg.id && !msg.content}
+                {@const hasReasoning = reasoningMessageId === msg.id && reasoningText.length > 0}
+                {@const elapsedMs =
+                  reasoningElapsedMs ??
+                  (reasoningStartMs !== null ? Date.now() - reasoningStartMs : 0)}
+                {#if isThinking || hasReasoning}
+                  <details
+                    class="reasoning-details mb-1.5 text-xs text-neutral-500 dark:text-neutral-400 border-l-2 border-neutral-300 dark:border-neutral-700 pl-3"
+                    bind:open={reasoningOpen}
+                  >
+                    <summary class="reasoning-summary cursor-pointer select-none flex items-baseline gap-1.5 hover:text-neutral-700 dark:hover:text-neutral-300">
+                      {#if isThinking}
+                        <span class="thinking-shimmer italic flex-shrink-0">Thinking…</span>
+                        {#if reasoningTail}
+                          <span
+                            class="reasoning-tail"
+                            transition:fade={{ duration: 150 }}
+                          >· {reasoningTail}</span>
+                        {/if}
+                      {:else}
+                        <span class="italic">Thought for {Math.max(1, Math.round(elapsedMs / 1000))}s</span>
+                      {/if}
+                    </summary>
+                    {#if reasoningText}
+                      {#if isThinking}
+                        <div class="reasoning-stream-window mt-1.5 relative">
+                          <div
+                            class="reasoning-stream-body whitespace-pre-wrap italic leading-relaxed opacity-80"
+                            bind:this={reasoningBodyEl}
+                          >
+                            {reasoningText}
+                          </div>
+                        </div>
+                      {:else}
+                        <div class="mt-1.5 whitespace-pre-wrap italic leading-relaxed opacity-80">
+                          {reasoningText}
+                        </div>
+                      {/if}
+                    {/if}
+                  </details>
+                {/if}
                 {#if msg.content}
                   <Markdown
                     source={msg.content}
                     throttle={streamingMessageId === msg.id}
                   />
-                {:else if streamingMessageId === msg.id}
-                  <span class="typing-dots" aria-label="Thinking">
-                    <span></span><span></span><span></span>
-                  </span>
                 {/if}
                 {#if streamingMessageId !== msg.id && msg.content}
                   <ReceiptChips
                     turnId={msg.id}
-                    onOpenAudit={() => (showAudit = true)}
+                    onOpenAudit={(beliefId) => {
+                      auditTargetBelief = beliefId;
+                      showAudit = true;
+                    }}
                   />
                 {/if}
               {:else}
@@ -672,10 +783,10 @@
         oninput={autoResizeTextarea}
         onkeydown={onKeydown}
         disabled={!!streaming}
-        class="flex-1 resize-none rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-50 transition-all"
+        class="flex-1 resize-none rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 disabled:opacity-50 transition-all"
+        style="min-height: 2.75rem; max-height: 15rem; --tw-ring-color: rgb(var(--pal-accent));"
         rows="2"
-        style="min-height: 2.75rem; max-height: 15rem;"
-        placeholder="Message Palamedes… (Enter to send, Shift+Enter for newline, Ctrl+Enter for branch)"
+        placeholder="Message Palamedes…"
       ></textarea>
 
       {#if streaming}
@@ -691,8 +802,8 @@
             onclick={() => send(true)}
             disabled={!input.trim()}
             title="Send as new branch (Ctrl+Enter) — creates a sibling of the current leaf"
-            class="flex-1 rounded-md border border-violet-400/60 bg-white dark:bg-neutral-900 text-violet-600 dark:text-violet-300
-                   hover:bg-violet-50 dark:hover:bg-violet-950 disabled:opacity-40
+            class="flex-1 rounded-md border pal-accent-border bg-white dark:bg-neutral-900 pal-accent-text
+                   hover:pal-accent-soft-bg disabled:opacity-40
                    px-3 text-xs font-medium inline-flex items-center justify-center gap-1"
           >
             <span>↳</span>
@@ -702,7 +813,7 @@
             onclick={() => send(false)}
             disabled={!input.trim()}
             title="Send (Enter)"
-            class="flex-1 rounded-md bg-violet-500 hover:bg-violet-600 disabled:opacity-40
+            class="flex-1 rounded-md pal-accent-bg hover:opacity-90 disabled:opacity-40
                    text-white px-3 text-sm font-medium"
           >
             Send
@@ -723,17 +834,23 @@
   {/if}
 
   {#if showAudit}
-    <Audit onClose={() => (showAudit = false)} />
+    <Audit
+      onClose={() => {
+        showAudit = false;
+        auditTargetBelief = null;
+      }}
+      targetBelief={auditTargetBelief}
+    />
   {/if}
 
   {#if showRecap}
     <Recap onClose={() => (showRecap = false)} />
   {/if}
-
-  {#if showCapture}
-    <Capture onClose={() => (showCapture = false)} />
-  {/if}
 </div>
+
+{#if showGraph}
+  <Graph onClose={() => (showGraph = false)} />
+{/if}
 
 {#if showSettings}
   <Settings onClose={() => (showSettings = false)} />

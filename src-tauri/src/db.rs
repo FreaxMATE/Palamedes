@@ -76,6 +76,15 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Migration: add `label` column to existing `beliefs` rows. SQLite
+        // has no `IF NOT EXISTS` for ADD COLUMN, so swallow the duplicate-
+        // column error.
+        if let Err(e) = conn.execute("ALTER TABLE beliefs ADD COLUMN label TEXT", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["system_prompt", DEFAULT_SYSTEM_PROMPT],
@@ -91,11 +100,32 @@ impl Db {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-            params!["model", "deepseek-ai/DeepSeek-V3.2"],
+            params!["model", "moonshotai/Kimi-K2.5"],
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["embedding_model", crate::embeddings::DEFAULT_EMBEDDING_MODEL],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            params![
+                "dedup_cosine_threshold",
+                crate::embeddings::DEFAULT_DEDUP_COSINE_THRESHOLD.to_string()
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            params![
+                "dedup_suggest_threshold",
+                crate::embeddings::DEFAULT_SUGGEST_COSINE_THRESHOLD.to_string()
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            params![
+                "retrieval_min_cosine",
+                crate::embeddings::DEFAULT_RETRIEVAL_MIN_COSINE.to_string()
+            ],
         )?;
         // Migrate the previous default (Qwen3-Embedding-0.6B was a guess that
         // turned out not to be hosted on Nebius) to the actual SOTA option.
@@ -132,11 +162,13 @@ impl Db {
                 conn.execute_batch(SCHEMA)?;
             }
         }
-        // Migrate the previous default from Kimi to DeepSeek. A user-picked model
-        // (anything other than the old default) is left alone.
+        // Migrate the previous default from DeepSeek back to Kimi after the
+        // 2026-05-06 dogfood showed Kimi K2.5 produces materially better
+        // chat completions and stops fabricating company names. A user-
+        // picked model (anything other than the old default) is left alone.
         conn.execute(
-            "UPDATE settings SET value = 'deepseek-ai/DeepSeek-V3.2'
-             WHERE key = 'model' AND value = 'moonshotai/Kimi-K2.5'",
+            "UPDATE settings SET value = 'moonshotai/Kimi-K2.5'
+             WHERE key = 'model' AND value = 'deepseek-ai/DeepSeek-V3.2'",
             [],
         )?;
         Ok(Self {
@@ -184,6 +216,41 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE conversation_id = ?1", params![id])?;
         conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Wipe every conversation + message, leaving the belief ledger,
+    /// embeddings, and settings intact. Cascades clear `recall_receipts`
+    /// and `extraction_log` via FK ON DELETE CASCADE; beliefs whose
+    /// provenance pointed at deleted turns keep dangling source_ids
+    /// (audit UI tolerates missing previews).
+    pub fn wipe_chats(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM messages", [])?;
+        tx.execute("DELETE FROM conversations", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Nuke everything except `settings`: chats, beliefs, artifacts,
+    /// embeddings, position cache, blocklist, logs. Settings (model,
+    /// system prompt, embedding model, dedup thresholds) survive.
+    pub fn wipe_all_data(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM recall_receipts", [])?;
+        tx.execute("DELETE FROM extraction_log", [])?;
+        tx.execute("DELETE FROM belief_provenance", [])?;
+        tx.execute("DELETE FROM belief_versions", [])?;
+        tx.execute("DELETE FROM belief_blocklist", [])?;
+        tx.execute("DELETE FROM belief_positions", [])?;
+        tx.execute("DELETE FROM vec_beliefs", [])?;
+        tx.execute("DELETE FROM beliefs", [])?;
+        tx.execute("DELETE FROM artifacts", [])?;
+        tx.execute("DELETE FROM messages", [])?;
+        tx.execute("DELETE FROM conversations", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -373,6 +440,35 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Persist the short keyword label generated for a belief by the LLM.
+    /// Idempotent: pass the same label twice, no-op.
+    pub fn set_belief_label(&self, belief_id: &str, label: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE beliefs SET label = ?1 WHERE id = ?2",
+            params![label, belief_id],
+        )?;
+        Ok(())
+    }
+
+    /// Beliefs with no label yet — used by the regenerate-labels backfill.
+    /// Returns (id, statement) so the caller can do one LLM call per row.
+    pub fn list_unlabeled_beliefs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT b.id, bv.statement
+             FROM beliefs b
+             JOIN belief_versions bv ON bv.id = b.current_version_id
+             WHERE (b.label IS NULL OR b.label = '')
+               AND b.status NOT IN ('blocked','expired')
+             ORDER BY b.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Collect active blocklist hints for the extraction prompt:
@@ -581,4 +677,49 @@ pub struct RetrievedBelief {
     pub status: String,
     pub level: i32,
     pub distance: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DedupCandidate {
+    pub belief_id: String,
+    pub version_id: String,
+    pub statement: String,
+    pub status: String,
+    pub distance: f64,
+}
+
+/// Find the single nearest existing belief (by L2 distance) to `query_vec`.
+/// Unlike `Db::retrieve_top_k`, this does *not* filter by status — the caller
+/// needs to see blocked/expired matches in order to drop blocked-near-dupes
+/// silently rather than reinserting them.
+pub fn find_top_dedup_match(
+    conn: &Connection,
+    query_vec: &[f32],
+) -> Result<Option<DedupCandidate>> {
+    let blob = crate::embeddings::vec_to_blob(query_vec)?;
+    let row = conn
+        .query_row(
+            "SELECT v.belief_id, v.distance, b.current_version_id, bv.statement, b.status
+             FROM (
+                 SELECT belief_id, distance
+                 FROM vec_beliefs
+                 WHERE embedding MATCH ?1 AND k = 1
+                 ORDER BY distance
+             ) v
+             JOIN beliefs b           ON b.id = v.belief_id
+             JOIN belief_versions bv  ON bv.id = b.current_version_id
+             LIMIT 1",
+            params![blob],
+            |r| {
+                Ok(DedupCandidate {
+                    belief_id: r.get(0)?,
+                    distance: r.get(1)?,
+                    version_id: r.get(2)?,
+                    statement: r.get(3)?,
+                    status: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
 }
