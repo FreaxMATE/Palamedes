@@ -7,10 +7,21 @@ license = "MIT"
 repository = "https://github.com/FreaxMATE/Palamedes"
 edition = "2021"
 rust-version = "1.77.2"
+# Two binaries ship from this crate: the Tauri app (`palamedes`) and the
+# stdio MCP shim (`palamedes-mcp`, in src/bin/palamedes_mcp.rs). Tauri
+# dev/build invokes `cargo run` / `cargo build` without --bin, so set
+# the app as the default.
+default-run = "palamedes"
 
 [lib]
 name = "palamedes_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Stdio MCP shim for Claude Desktop. Speaks newline-delimited JSON-RPC on
+# stdin/stdout and forwards to the running Tauri app's HTTP+SSE server.
+[[bin]]
+name = "palamedes-mcp"
+path = "src/bin/palamedes_mcp.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
@@ -38,3 +49,10 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 sqlite-vec = "0.1"
 zerocopy = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+
+# MCP server (Phase C). `rmcp` is Anthropic's official Rust SDK.
+# Features: server-side tool handlers + the streamable-HTTP transport
+# (Cursor, Open WebUI, Witsy). The stdio shim binary speaks pure JSON-RPC
+# and doesn't need rmcp itself — it's a dumb HTTP proxy.
+rmcp = { version = "1.7", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+axum = "0.8"

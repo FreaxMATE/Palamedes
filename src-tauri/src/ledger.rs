@@ -58,6 +58,12 @@ pub enum SourceType {
     Turn,
     Artifact,
     Belief,
+    /// A user-accepted external `belief_proposals` row. Used in the
+    /// provenance of beliefs materialized from the MCP inbox.
+    Proposal,
+    /// The `mcp_clients` row whose tool call produced this edge. Paired
+    /// with `Proposal` to show "via MCP from <client>" in the audit UI.
+    McpClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +102,9 @@ str_enum!(Status,
 str_enum!(Scope,
     Global => "global", BranchLocal => "branch_local", BranchIsolated => "branch_isolated");
 str_enum!(Editor, User => "user", Ai => "ai", System => "system");
-str_enum!(SourceType, Turn => "turn", Artifact => "artifact", Belief => "belief");
+str_enum!(SourceType,
+    Turn => "turn", Artifact => "artifact", Belief => "belief",
+    Proposal => "proposal", McpClient => "mcp_client");
 str_enum!(ProvenanceRelation,
     ExtractedFrom => "extracted_from", ReinforcedBy => "reinforced_by",
     ContradictedBy => "contradicted_by", CorrectedBy => "corrected_by",

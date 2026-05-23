@@ -72,16 +72,21 @@ impl NebiusClient {
     pub fn from_env() -> anyhow::Result<Self> {
         let api_key = std::env::var("NEBIUS_API_KEY")
             .map_err(|_| anyhow::anyhow!("NEBIUS_API_KEY not set (check .env)"))?;
+        Ok(Self::from_api_key(api_key))
+    }
 
+    /// Construct a client from an explicit API key. Used by tests that
+    /// don't need to hit the network — the API key is required for the
+    /// struct but unused by code paths that don't call out.
+    pub fn from_api_key(api_key: String) -> Self {
         let config = OpenAIConfig::new()
             .with_api_key(api_key.clone())
             .with_api_base(NEBIUS_BASE_URL);
-
-        Ok(Self {
+        Self {
             client: Client::with_config(config),
             api_key,
             http: reqwest::Client::new(),
-        })
+        }
     }
 
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {

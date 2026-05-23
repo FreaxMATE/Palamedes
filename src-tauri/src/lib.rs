@@ -2,6 +2,7 @@ mod db;
 mod embeddings;
 mod extraction;
 mod ledger;
+mod mcp;
 mod nebius;
 mod recap;
 mod summarization;
@@ -55,6 +56,10 @@ pub struct AppState {
     db: Arc<Db>,
     active_streams: Mutex<HashMap<String, CancellationToken>>,
     data_dir: std::path::PathBuf,
+    /// MCP server handle when running. None when disabled / stopped.
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the start /
+    /// stop commands are async and need to hold the guard across `.await`.
+    mcp_server: tokio::sync::Mutex<Option<mcp::server::McpServerHandle>>,
 }
 
 /// What the extracted beliefs are extracted *from*. A chat turn carries the
@@ -1207,6 +1212,43 @@ fn get_belief_detail(state: State<'_, AppState>, id: String) -> Result<BeliefDet
                                  WHERE b.id = ?1",
                                 params![source_id],
                                 |r| r.get::<_, String>(0),
+                            )
+                            .ok(),
+                        "mcp_client" => conn
+                            .query_row(
+                                "SELECT name, version FROM mcp_clients WHERE id = ?1",
+                                params![source_id],
+                                |r| {
+                                    let name: String = r.get(0)?;
+                                    let version: Option<String> = r.get(1)?;
+                                    Ok(match version {
+                                        Some(v) => format!("via MCP from {name} v{v}"),
+                                        None => format!("via MCP from {name}"),
+                                    })
+                                },
+                            )
+                            .ok(),
+                        "proposal" => conn
+                            .query_row(
+                                "SELECT kind, statement, target_belief_id, correction_reason
+                                 FROM belief_proposals WHERE id = ?1",
+                                params![source_id],
+                                |r| {
+                                    let kind: String = r.get(0)?;
+                                    let statement: Option<String> = r.get(1)?;
+                                    let target: Option<String> = r.get(2)?;
+                                    let cr: Option<String> = r.get(3)?;
+                                    Ok(if kind == "propose" {
+                                        match statement {
+                                            Some(s) => format!("proposed: \"{s}\""),
+                                            None => "proposed (no statement)".into(),
+                                        }
+                                    } else {
+                                        let t = target.unwrap_or_default();
+                                        let r = cr.unwrap_or_default();
+                                        format!("correction of {}: \"{}\"", &t[..t.len().min(8)], r)
+                                    })
+                                },
                             )
                             .ok(),
                         _ => None,
@@ -2516,6 +2558,265 @@ pub(crate) async fn run_summarize_pass(
     Ok(report)
 }
 
+// ---------- MCP server (Phase C) ----------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct McpStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub port: Option<u16>,
+    pub token: Option<String>,
+    pub url: Option<String>,
+}
+
+#[tauri::command]
+async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
+    let enabled = state
+        .db
+        .get_setting("mcp_server_enabled")
+        .map_err(|e| e.to_string())?
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let token = state
+        .db
+        .get_setting("mcp_server_token")
+        .map_err(|e| e.to_string())?;
+    let guard = state.mcp_server.lock().await;
+    let (running, port, url) = match guard.as_ref() {
+        Some(h) => (true, Some(h.port), Some(h.url())),
+        None => (false, None, None),
+    };
+    Ok(McpStatus {
+        enabled,
+        running,
+        port,
+        token,
+        url,
+    })
+}
+
+#[tauri::command]
+async fn mcp_start(state: State<'_, AppState>) -> Result<McpStatus, String> {
+    let mut guard = state.mcp_server.lock().await;
+    if guard.is_some() {
+        // Already running — return current status idempotently.
+        drop(guard);
+        return mcp_status(state).await;
+    }
+    let port: u16 = state
+        .db
+        .get_setting("mcp_server_port")
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5180);
+    let token = match state
+        .db
+        .get_setting("mcp_server_token")
+        .map_err(|e| e.to_string())?
+    {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let t = mcp::server::generate_token();
+            state
+                .db
+                .set_setting("mcp_server_token", &t)
+                .map_err(|e| e.to_string())?;
+            t
+        }
+    };
+    let handle = mcp::server::start(state.db.clone(), state.client.clone(), port, token.clone())
+        .await
+        .map_err(|e| format!("mcp_start failed: {e}"))?;
+    state
+        .db
+        .set_setting("mcp_server_enabled", "true")
+        .map_err(|e| e.to_string())?;
+    let info = McpStatus {
+        enabled: true,
+        running: true,
+        port: Some(handle.port),
+        token: Some(handle.token.clone()),
+        url: Some(handle.url()),
+    };
+    *guard = Some(handle);
+    Ok(info)
+}
+
+#[tauri::command]
+async fn mcp_stop(state: State<'_, AppState>) -> Result<McpStatus, String> {
+    let handle = state.mcp_server.lock().await.take();
+    if let Some(h) = handle {
+        h.shutdown().await;
+    }
+    state
+        .db
+        .set_setting("mcp_server_enabled", "false")
+        .map_err(|e| e.to_string())?;
+    let token = state
+        .db
+        .get_setting("mcp_server_token")
+        .map_err(|e| e.to_string())?;
+    Ok(McpStatus {
+        enabled: false,
+        running: false,
+        port: None,
+        token,
+        url: None,
+    })
+}
+
+#[tauri::command]
+async fn mcp_list_proposals(
+    state: State<'_, AppState>,
+    status: Option<String>,
+) -> Result<Vec<mcp::proposals::Proposal>, String> {
+    let filter = match status.as_deref() {
+        Some("pending") => Some(mcp::proposals::ProposalStatus::Pending),
+        Some("accepted") => Some(mcp::proposals::ProposalStatus::Accepted),
+        Some("rejected") => Some(mcp::proposals::ProposalStatus::Rejected),
+        Some("superseded") => Some(mcp::proposals::ProposalStatus::Superseded),
+        Some(other) => return Err(format!("unknown status filter: {other}")),
+        None => None,
+    };
+    state
+        .db
+        .with_conn(|conn| mcp::proposals::list_proposals(conn, filter))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mcp_accept_proposal(
+    state: State<'_, AppState>,
+    proposal_id: String,
+    statement: Option<String>,
+    category: Option<String>,
+    confidence: Option<f64>,
+    trust_class: Option<String>,
+) -> Result<String, String> {
+    let tc = match trust_class.as_deref() {
+        None => None,
+        Some(s) => Some(ledger::TrustClass::from_str(s).map_err(|e| e.to_string())?),
+    };
+    let override_ = if statement.is_some() || category.is_some() || confidence.is_some() || tc.is_some() {
+        Some(mcp::proposals::AcceptOverride {
+            statement,
+            category,
+            confidence,
+            trust_class: tc,
+        })
+    } else {
+        None
+    };
+    let belief_id = state
+        .db
+        .with_conn_mut(|conn| mcp::proposals::accept_proposal(conn, &proposal_id, override_.clone()))
+        .map_err(|e| e.to_string())?;
+    // Kick off embedding for the new belief in the background — the
+    // existing embed_unembedded_beliefs path will pick it up on its
+    // next sweep too, but doing it now means the next chat turn
+    // immediately benefits from retrieval.
+    let db_clone = state.db.clone();
+    let client_clone = state.client.clone();
+    let belief_id_clone = belief_id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Ok(Some(statement)) = db_clone.with_conn(|conn| {
+            let s: Option<String> = conn
+                .query_row(
+                    "SELECT bv.statement FROM beliefs b
+                     JOIN belief_versions bv ON bv.id = b.current_version_id
+                     WHERE b.id = ?1",
+                    rusqlite::params![&belief_id_clone],
+                    |r| r.get(0),
+                )
+                .ok();
+            anyhow::Ok(s)
+        }) {
+            let model = db_clone
+                .get_setting("embedding_model")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| embeddings::DEFAULT_EMBEDDING_MODEL.to_string());
+            if let Ok(mut v) = client_clone.embed(&model, &statement).await {
+                if v.len() == embeddings::EMBEDDING_DIM {
+                    embeddings::normalize(&mut v);
+                    if let Ok(blob) = embeddings::vec_to_blob(&v) {
+                        let _ = db_clone.with_conn(|conn| {
+                            conn.execute(
+                                "INSERT OR REPLACE INTO vec_beliefs (belief_id, embedding) VALUES (?1, ?2)",
+                                rusqlite::params![&belief_id_clone, &blob],
+                            )?;
+                            anyhow::Ok(())
+                        });
+                    }
+                }
+            }
+        }
+    });
+    Ok(belief_id)
+}
+
+#[tauri::command]
+async fn mcp_reject_proposal(
+    state: State<'_, AppState>,
+    proposal_id: String,
+) -> Result<(), String> {
+    state
+        .db
+        .with_conn(|conn| mcp::proposals::reject_proposal(conn, &proposal_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mcp_list_clients(state: State<'_, AppState>) -> Result<Vec<mcp::consent::McpClient>, String> {
+    state
+        .db
+        .with_conn(|conn| mcp::consent::list_clients(conn))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mcp_set_consent(
+    state: State<'_, AppState>,
+    client_id: String,
+    consent_read: bool,
+    consent_write: bool,
+) -> Result<(), String> {
+    state
+        .db
+        .with_conn(|conn| mcp::consent::set_consent(conn, &client_id, consent_read, consent_write))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mcp_revoke_client(state: State<'_, AppState>, client_id: String) -> Result<(), String> {
+    state
+        .db
+        .with_conn(|conn| mcp::consent::revoke_client(conn, &client_id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mcp_rotate_token(state: State<'_, AppState>) -> Result<McpStatus, String> {
+    let new_token = mcp::server::generate_token();
+    state
+        .db
+        .set_setting("mcp_server_token", &new_token)
+        .map_err(|e| e.to_string())?;
+    // If the server is running, stop it — the new token won't take effect
+    // until the user clicks Start again. We surface this by setting enabled
+    // back to false; the Settings UI explains why.
+    let handle = state.mcp_server.lock().await.take();
+    if let Some(h) = handle {
+        h.shutdown().await;
+        state
+            .db
+            .set_setting("mcp_server_enabled", "false")
+            .map_err(|e| e.to_string())?;
+    }
+    mcp_status(state).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = dotenvy::dotenv();
@@ -2547,6 +2848,7 @@ pub fn run() {
                 db,
                 active_streams: Mutex::new(HashMap::new()),
                 data_dir,
+                mcp_server: tokio::sync::Mutex::new(None),
             });
 
             if cfg!(debug_assertions) {
@@ -2613,6 +2915,16 @@ pub fn run() {
             get_turns_for_belief,
             get_belief_embeddings,
             save_belief_positions,
+            mcp_status,
+            mcp_start,
+            mcp_stop,
+            mcp_rotate_token,
+            mcp_list_clients,
+            mcp_set_consent,
+            mcp_revoke_client,
+            mcp_list_proposals,
+            mcp_accept_proposal,
+            mcp_reject_proposal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

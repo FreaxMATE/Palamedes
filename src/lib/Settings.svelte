@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { getSetting, setSetting, wipeChats, wipeAllData } from "./chat";
+  import {
+    getSetting, setSetting, wipeChats, wipeAllData,
+    mcpStatus, mcpStart, mcpStop, mcpRotateToken,
+    mcpListClients, mcpSetConsent, mcpRevokeClient,
+    type McpStatus, type McpClient,
+  } from "./chat";
   import { ensureModels, getCachedModels } from "./modelStore";
   import { onMount } from "svelte";
   import { themeState, PALETTES, type Palette } from "./theme.svelte";
@@ -9,6 +14,9 @@
   }
 
   let { onClose }: Props = $props();
+
+  type Tab = "general" | "connections";
+  let activeTab: Tab = $state("general");
 
   let systemPrompt = $state("");
   let model = $state("");
@@ -20,6 +28,138 @@
   let modelsError: string | null = $state(null);
   let loaded = $state(false);
   let advancedOpen = $state(false);
+
+  // MCP server state
+  let mcp: McpStatus | null = $state(null);
+  let mcpClients: McpClient[] = $state([]);
+  let mcpBusy = $state(false);
+  let mcpError: string | null = $state(null);
+  let showToken = $state(false);
+  let copiedField: string | null = $state(null);
+
+  async function refreshMcp() {
+    try {
+      [mcp, mcpClients] = await Promise.all([mcpStatus(), mcpListClients()]);
+      mcpError = null;
+    } catch (e: any) {
+      mcpError = e?.message ?? String(e);
+    }
+  }
+
+  async function setConsent(
+    clientId: string,
+    consentRead: boolean,
+    consentWrite: boolean,
+  ) {
+    mcpBusy = true;
+    mcpError = null;
+    try {
+      await mcpSetConsent(clientId, consentRead, consentWrite);
+      mcpClients = await mcpListClients();
+    } catch (e: any) {
+      mcpError = e?.message ?? String(e);
+    } finally {
+      mcpBusy = false;
+    }
+  }
+
+  async function revokeClient(clientId: string) {
+    mcpBusy = true;
+    mcpError = null;
+    try {
+      await mcpRevokeClient(clientId);
+      mcpClients = await mcpListClients();
+    } catch (e: any) {
+      mcpError = e?.message ?? String(e);
+    } finally {
+      mcpBusy = false;
+    }
+  }
+
+  function clientStatusLabel(c: McpClient): { label: string; tone: string } {
+    if (c.revoked_at) return { label: "revoked", tone: "neutral" };
+    if (c.consent_read === null || c.consent_write === null)
+      return { label: "pending", tone: "amber" };
+    if (c.consent_read && c.consent_write)
+      return { label: "read + write", tone: "emerald" };
+    if (c.consent_read) return { label: "read only", tone: "sky" };
+    if (c.consent_write) return { label: "write only", tone: "sky" };
+    return { label: "denied", tone: "rose" };
+  }
+
+  async function toggleMcp() {
+    mcpBusy = true;
+    mcpError = null;
+    try {
+      mcp = mcp?.running ? await mcpStop() : await mcpStart();
+    } catch (e: any) {
+      mcpError = e?.message ?? String(e);
+    } finally {
+      mcpBusy = false;
+    }
+  }
+
+  async function rotateToken() {
+    mcpBusy = true;
+    mcpError = null;
+    try {
+      mcp = await mcpRotateToken();
+    } catch (e: any) {
+      mcpError = e?.message ?? String(e);
+    } finally {
+      mcpBusy = false;
+    }
+  }
+
+  async function copyToClipboard(value: string, field: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      copiedField = field;
+      window.setTimeout(() => {
+        if (copiedField === field) copiedField = null;
+      }, 1500);
+    } catch (e) {
+      // best-effort; ignore.
+    }
+  }
+
+  function claudeDesktopSnippet(): string {
+    // Stdio path: ships in Day 7. Until then, surface a placeholder so
+    // Claude Desktop users know it's coming.
+    return JSON.stringify(
+      {
+        mcpServers: {
+          palamedes: {
+            command: "palamedes-mcp",
+            // The shim reads PALAMEDES_MCP_URL + PALAMEDES_MCP_TOKEN.
+            env: {
+              PALAMEDES_MCP_URL: mcp?.url ?? "http://127.0.0.1:5180/mcp",
+              PALAMEDES_MCP_TOKEN: mcp?.token ?? "<token>",
+            },
+          },
+        },
+      },
+      null,
+      2,
+    );
+  }
+
+  function cursorSnippet(): string {
+    return JSON.stringify(
+      {
+        mcpServers: {
+          palamedes: {
+            url: mcp?.url ?? "http://127.0.0.1:5180/mcp",
+            headers: {
+              Authorization: `Bearer ${mcp?.token ?? "<token>"}`,
+            },
+          },
+        },
+      },
+      null,
+      2,
+    );
+  }
 
   onMount(async () => {
     // Use cached model list if available — opens instantly.
@@ -43,6 +183,9 @@
     suggestThreshold = st ?? "0.70";
     retrievalMinCosine = rt ?? "0.35";
     loaded = true;
+
+    // MCP status — best-effort; the Connections tab handles errors.
+    await refreshMcp();
 
     // Kick off a refresh in the background (cheap if already cached).
     if (!cached.models) {
@@ -141,7 +284,37 @@
   >
     <h2 class="text-lg font-semibold mb-4">Settings</h2>
 
-    {#if loaded}
+    <!-- Tab strip -->
+    <div class="flex gap-1 mb-5 border-b border-neutral-200 dark:border-neutral-800">
+      <button
+        type="button"
+        onclick={() => (activeTab = "general")}
+        class="px-3 py-1.5 text-sm font-medium -mb-px border-b-2 transition-colors
+               {activeTab === 'general'
+                 ? 'pal-accent-text pal-accent-border'
+                 : 'text-neutral-500 border-transparent hover:text-neutral-900 dark:hover:text-neutral-100'}"
+      >
+        General
+      </button>
+      <button
+        type="button"
+        onclick={() => (activeTab = "connections")}
+        class="px-3 py-1.5 text-sm font-medium -mb-px border-b-2 transition-colors
+               {activeTab === 'connections'
+                 ? 'pal-accent-text pal-accent-border'
+                 : 'text-neutral-500 border-transparent hover:text-neutral-900 dark:hover:text-neutral-100'}"
+      >
+        Connections
+        {#if mcp?.running}
+          <span
+            class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 ml-1 align-middle"
+            title="MCP server is running"
+          ></span>
+        {/if}
+      </button>
+    </div>
+
+    {#if loaded && activeTab === "general"}
       <div class="space-y-5">
         <div>
           <label class="block text-sm font-medium mb-2">Theme</label>
@@ -378,6 +551,237 @@
               </p>
             {/if}
           </div>
+        </div>
+      </div>
+    {:else if loaded && activeTab === "connections"}
+      <div class="space-y-5">
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <h3 class="text-sm font-semibold">MCP server</h3>
+            <span
+              class="text-xs font-medium px-2 py-0.5 rounded-full
+                     {mcp?.running
+                       ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400'
+                       : 'bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400'}"
+            >
+              {mcp?.running ? "● running" : "○ stopped"}
+            </span>
+          </div>
+          <p class="text-xs text-neutral-500 mb-3">
+            Expose your Belief Ledger to external AIs (Claude Desktop, Cursor,
+            Witsy, Open WebUI) over the Model Context Protocol. Read tools query
+            the corpus; write tools land in an audit inbox you review.
+            <strong class="text-neutral-700 dark:text-neutral-300">
+              Listens on 127.0.0.1 only.
+            </strong>
+            Off by default — turn it on when you want external AIs to see your
+            beliefs.
+          </p>
+
+          {#if mcpError}
+            <p class="text-xs text-red-500 mb-3">
+              {mcpError}
+            </p>
+          {/if}
+
+          <div class="flex gap-2 mb-4">
+            <button
+              type="button"
+              onclick={toggleMcp}
+              disabled={mcpBusy}
+              class="px-3 py-1.5 text-sm rounded-md disabled:opacity-50
+                     {mcp?.running
+                       ? 'border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800'
+                       : 'pal-accent-bg hover:opacity-90 text-white'}"
+            >
+              {mcpBusy ? "…" : mcp?.running ? "Stop server" : "Start server"}
+            </button>
+            <button
+              type="button"
+              onclick={rotateToken}
+              disabled={mcpBusy}
+              class="px-3 py-1.5 text-sm rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              title="Generate a new token. The server stops if it was running — restart to apply."
+            >
+              Rotate token
+            </button>
+          </div>
+
+          {#if mcp?.url}
+            <div class="space-y-2 mb-4">
+              <div>
+                <label class="block text-xs font-medium text-neutral-500 mb-1">
+                  URL
+                </label>
+                <div class="flex gap-2">
+                  <code class="flex-1 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 px-2 py-1.5 font-mono">
+                    {mcp.url}
+                  </code>
+                  <button
+                    type="button"
+                    onclick={() => copyToClipboard(mcp!.url!, "url")}
+                    class="px-2 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  >
+                    {copiedField === "url" ? "✓" : "Copy"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if mcp?.token}
+            <div class="mb-4">
+              <label class="block text-xs font-medium text-neutral-500 mb-1">
+                Bearer token
+              </label>
+              <div class="flex gap-2">
+                <code class="flex-1 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 px-2 py-1.5 font-mono truncate">
+                  {showToken
+                    ? mcp.token
+                    : "•".repeat(Math.min(mcp.token.length, 48))}
+                </code>
+                <button
+                  type="button"
+                  onclick={() => (showToken = !showToken)}
+                  class="px-2 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                >
+                  {showToken ? "Hide" : "Show"}
+                </button>
+                <button
+                  type="button"
+                  onclick={() => copyToClipboard(mcp!.token!, "token")}
+                  class="px-2 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                >
+                  {copiedField === "token" ? "✓" : "Copy"}
+                </button>
+              </div>
+              <p class="text-[11px] text-neutral-500 mt-1">
+                Required on every MCP request as
+                <code>Authorization: Bearer …</code>. If you ever paste this
+                into a screenshot, hit Rotate token.
+              </p>
+            </div>
+          {/if}
+
+          {#if mcpClients.length > 0}
+            <div class="border-t border-neutral-200 dark:border-neutral-800 pt-4 mb-4">
+              <div class="flex items-center justify-between mb-2">
+                <h4 class="text-sm font-semibold">Connected clients</h4>
+                <button
+                  type="button"
+                  onclick={refreshMcp}
+                  disabled={mcpBusy}
+                  class="text-xs underline text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 disabled:opacity-50"
+                >
+                  Refresh
+                </button>
+              </div>
+              <p class="text-[11px] text-neutral-500 mb-3">
+                AIs that have tried to connect. Pending clients can't call any
+                tool until you grant consent. Revoke any you don't recognize.
+              </p>
+              <ul class="space-y-2">
+                {#each mcpClients as c (c.id)}
+                  {@const status = clientStatusLabel(c)}
+                  <li class="rounded-md border border-neutral-200 dark:border-neutral-800 p-3">
+                    <div class="flex items-center justify-between gap-2 mb-2">
+                      <div class="min-w-0">
+                        <div class="text-sm font-medium truncate">
+                          {c.name}{c.version ? ` v${c.version}` : ""}
+                        </div>
+                        <div class="text-[11px] text-neutral-500">
+                          first seen {new Date(c.first_seen_at).toLocaleString()}
+                        </div>
+                      </div>
+                      <span
+                        class="text-[11px] font-medium px-2 py-0.5 rounded-full
+                               {status.tone === 'emerald'
+                                 ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400'
+                                 : status.tone === 'sky'
+                                 ? 'bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-400'
+                                 : status.tone === 'amber'
+                                 ? 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400'
+                                 : status.tone === 'rose'
+                                 ? 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-400'
+                                 : 'bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400'}"
+                      >
+                        {status.label}
+                      </span>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <button
+                        type="button"
+                        disabled={mcpBusy}
+                        onclick={() => setConsent(c.id, true, false)}
+                        class="text-xs px-2 py-1 rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                      >Read only</button>
+                      <button
+                        type="button"
+                        disabled={mcpBusy}
+                        onclick={() => setConsent(c.id, true, true)}
+                        class="text-xs px-2 py-1 rounded-md pal-accent-bg text-white hover:opacity-90 disabled:opacity-50"
+                      >Read + write</button>
+                      <button
+                        type="button"
+                        disabled={mcpBusy}
+                        onclick={() => setConsent(c.id, false, false)}
+                        class="text-xs px-2 py-1 rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                      >Deny</button>
+                      {#if !c.revoked_at}
+                        <button
+                          type="button"
+                          disabled={mcpBusy}
+                          onclick={() => revokeClient(c.id)}
+                          class="ml-auto text-xs px-2 py-1 rounded-md border border-red-300 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 disabled:opacity-50"
+                        >Revoke</button>
+                      {/if}
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+
+          {#if mcp?.url && mcp?.token}
+            <div class="border-t border-neutral-200 dark:border-neutral-800 pt-4">
+              <h4 class="text-sm font-semibold mb-1">Client config</h4>
+              <p class="text-[11px] text-neutral-500 mb-3">
+                Drop the snippet for your client into its MCP config. Cursor
+                points at the URL directly; Claude Desktop runs the
+                <code>palamedes-mcp</code> shim (ships next).
+              </p>
+
+              <div class="space-y-3">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs font-medium text-neutral-500">Cursor (~/.cursor/mcp.json)</span>
+                    <button
+                      type="button"
+                      onclick={() => copyToClipboard(cursorSnippet(), "cursor")}
+                      class="text-xs underline pal-accent-text"
+                    >
+                      {copiedField === "cursor" ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                  <pre class="text-[11px] rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 p-2 overflow-x-auto font-mono">{cursorSnippet()}</pre>
+                </div>
+
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs font-medium text-neutral-500">Claude Desktop (claude_desktop_config.json)</span>
+                    <button
+                      type="button"
+                      onclick={() => copyToClipboard(claudeDesktopSnippet(), "claude")}
+                      class="text-xs underline pal-accent-text"
+                    >
+                      {copiedField === "claude" ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                  <pre class="text-[11px] rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 p-2 overflow-x-auto font-mono">{claudeDesktopSnippet()}</pre>
+                </div>
+              </div>
+            </div>
+          {/if}
         </div>
       </div>
     {:else}

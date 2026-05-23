@@ -35,3 +35,4 @@ src-tauri/gen/schemas
 docs/ROADMAP.md
 docs/MAP_PLAN.md
 .claude/
+.plans/

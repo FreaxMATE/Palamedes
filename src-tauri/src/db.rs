@@ -85,6 +85,7 @@ impl Db {
                 return Err(e.into());
             }
         }
+        migrate_provenance_check_constraint(&conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["system_prompt", DEFAULT_SYSTEM_PROMPT],
@@ -126,6 +127,17 @@ impl Db {
                 "retrieval_min_cosine",
                 crate::embeddings::DEFAULT_RETRIEVAL_MIN_COSINE.to_string()
             ],
+        )?;
+        // MCP server (Phase C). Off by default — local-first contract.
+        // Token is generated on first enable; we don't seed one so a
+        // disabled server has no credential lying around.
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            params!["mcp_server_enabled", "false"],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            params!["mcp_server_port", "5180"],
         )?;
         // Migrate the previous default (Qwen3-Embedding-0.6B was a guess that
         // turned out not to be hosted on Nebius) to the actual SOTA option.
@@ -534,6 +546,17 @@ impl Db {
         f(&conn)
     }
 
+    /// `with_conn` variant for callers that need a `&mut Connection` —
+    /// e.g. anything that starts a `conn.transaction()`. Same lock
+    /// semantics as `with_conn`.
+    pub fn with_conn_mut<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T>,
+    {
+        let mut conn = self.conn.lock().unwrap();
+        f(&mut conn)
+    }
+
     /// Upsert a single belief's embedding into the vec0 virtual table. The
     /// caller is responsible for L2-normalizing the vector beforehand.
     pub fn upsert_embedding(&self, belief_id: &str, vec: &[f32]) -> Result<()> {
@@ -688,6 +711,55 @@ pub struct DedupCandidate {
     pub distance: f64,
 }
 
+/// Phase C migration: extend `belief_provenance.source_type` CHECK to accept
+/// `'proposal'` and `'mcp_client'`. SQLite can't ALTER a CHECK constraint, so
+/// we rename-table-dance on existing DBs. Idempotent: if the constraint
+/// already includes `'mcp_client'`, this is a no-op. Returns whether the
+/// migration ran.
+fn migrate_provenance_check_constraint(conn: &Connection) -> Result<bool> {
+    let existing_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='belief_provenance'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(sql) = existing_sql else {
+        return Ok(false); // fresh DB: schema.sql already wrote the new CHECK
+    };
+    if sql.contains("'mcp_client'") {
+        return Ok(false);
+    }
+    conn.execute_batch(
+        r#"
+        BEGIN;
+        CREATE TABLE belief_provenance_new (
+            id                TEXT PRIMARY KEY,
+            belief_version_id TEXT NOT NULL REFERENCES belief_versions(id) ON DELETE CASCADE,
+            source_type       TEXT NOT NULL CHECK (source_type IN
+                                ('turn','artifact','belief','proposal','mcp_client')),
+            source_id         TEXT NOT NULL,
+            relation          TEXT NOT NULL CHECK (relation IN
+                                ('extracted_from','reinforced_by','contradicted_by',
+                                 'corrected_by','summarizes')),
+            created_at        TEXT NOT NULL
+        );
+        INSERT INTO belief_provenance_new
+            (id, belief_version_id, source_type, source_id, relation, created_at)
+        SELECT id, belief_version_id, source_type, source_id, relation, created_at
+        FROM belief_provenance;
+        DROP TABLE belief_provenance;
+        ALTER TABLE belief_provenance_new RENAME TO belief_provenance;
+        CREATE INDEX IF NOT EXISTS idx_provenance_version
+            ON belief_provenance(belief_version_id);
+        CREATE INDEX IF NOT EXISTS idx_provenance_source
+            ON belief_provenance(source_type, source_id);
+        COMMIT;
+        "#,
+    )?;
+    Ok(true)
+}
+
 /// Find the single nearest existing belief (by L2 distance) to `query_vec`.
 /// Unlike `Db::retrieve_top_k`, this does *not* filter by status — the caller
 /// needs to see blocked/expired matches in order to drop blocked-near-dupes
@@ -722,4 +794,143 @@ pub fn find_top_dedup_match(
         )
         .optional()?;
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pre-Phase-C belief_provenance CREATE statement, copied verbatim
+    /// from schema.sql before this commit. Lets us simulate an existing
+    /// dogfood DB and prove the rename-table dance migrates rows safely.
+    /// Includes a stub `belief_versions` because the new table's FK target
+    /// is validated when foreign_keys is on (which is the schema default).
+    const OLD_BELIEF_PROVENANCE_SCHEMA: &str = r#"
+        CREATE TABLE belief_versions (id TEXT PRIMARY KEY);
+        CREATE TABLE belief_provenance (
+            id                TEXT PRIMARY KEY,
+            belief_version_id TEXT NOT NULL,
+            source_type       TEXT NOT NULL CHECK (source_type IN ('turn','artifact','belief')),
+            source_id         TEXT NOT NULL,
+            relation          TEXT NOT NULL CHECK (relation IN
+                                ('extracted_from','reinforced_by','contradicted_by',
+                                 'corrected_by','summarizes')),
+            created_at        TEXT NOT NULL
+        );
+        CREATE INDEX idx_provenance_version ON belief_provenance(belief_version_id);
+        CREATE INDEX idx_provenance_source  ON belief_provenance(source_type, source_id);
+    "#;
+
+    #[test]
+    fn migration_preserves_rows_and_accepts_new_source_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_BELIEF_PROVENANCE_SCHEMA).unwrap();
+
+        // Seed belief_versions with the ids we'll reference. In a real
+        // dogfood DB these always exist; the test fixture has to model that.
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO belief_versions (id) VALUES (?1)",
+                params![format!("v{}", i)],
+            )
+            .unwrap();
+        }
+
+        // Seed with rows that use all three legacy source_types — exactly
+        // what a real dogfood DB looks like.
+        for (i, (src_type, relation)) in [
+            ("turn", "extracted_from"),
+            ("artifact", "extracted_from"),
+            ("belief", "summarizes"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO belief_provenance
+                   (id, belief_version_id, source_type, source_id, relation, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    format!("p{}", i),
+                    format!("v{}", i),
+                    src_type,
+                    format!("s{}", i),
+                    relation,
+                    "2026-05-23T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        }
+
+        // Confirm pre-migration CHECK rejects the new types.
+        let pre_reject = conn.execute(
+            "INSERT INTO belief_provenance
+               (id, belief_version_id, source_type, source_id, relation, created_at)
+             VALUES ('px', 'vx', 'mcp_client', 'sx', 'extracted_from', '2026-05-23T00:00:00Z')",
+            [],
+        );
+        assert!(pre_reject.is_err(), "old CHECK should reject mcp_client");
+
+        // Migrate.
+        let ran = migrate_provenance_check_constraint(&conn).unwrap();
+        assert!(ran, "migration should have run on the legacy schema");
+
+        // All three original rows survived.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM belief_provenance", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // New CHECK now accepts mcp_client + proposal.
+        for v in ["vx", "vy"] {
+            conn.execute("INSERT INTO belief_versions (id) VALUES (?1)", params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO belief_provenance
+               (id, belief_version_id, source_type, source_id, relation, created_at)
+             VALUES ('px', 'vx', 'mcp_client', 'sx', 'extracted_from', '2026-05-23T00:00:00Z')",
+            [],
+        )
+        .expect("mcp_client should now be allowed");
+        conn.execute(
+            "INSERT INTO belief_provenance
+               (id, belief_version_id, source_type, source_id, relation, created_at)
+             VALUES ('py', 'vy', 'proposal', 'sy', 'extracted_from', '2026-05-23T00:00:00Z')",
+            [],
+        )
+        .expect("proposal should now be allowed");
+
+        // Indexes recreated.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND tbl_name='belief_provenance'
+                   AND name IN ('idx_provenance_version','idx_provenance_source')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 2, "both provenance indexes should be present");
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_already_migrated_db() {
+        // register_vec_extension MUST run before open_in_memory — sqlite-vec
+        // is loaded via sqlite3_auto_extension which only fires on new
+        // connections. Calling it after open() is a no-op (Once-guarded).
+        crate::embeddings::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        // Apply the new schema directly (simulating a fresh DB).
+        conn.execute_batch(SCHEMA).unwrap();
+        let ran = migrate_provenance_check_constraint(&conn).unwrap();
+        assert!(!ran, "migration should no-op on a fresh DB");
+    }
+
+    #[test]
+    fn migration_is_noop_on_empty_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        let ran = migrate_provenance_check_constraint(&conn).unwrap();
+        assert!(!ran, "migration should no-op when table doesn't exist");
+    }
 }

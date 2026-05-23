@@ -115,7 +115,7 @@ export interface AuditBelief {
 }
 
 export interface ProvenanceItem {
-  source_type: "turn" | "artifact" | "belief";
+  source_type: "turn" | "artifact" | "belief" | "proposal" | "mcp_client";
   source_id: string;
   relation:
     | "extracted_from"
@@ -425,3 +425,90 @@ export function regenerate(
     onReasoning,
   );
 }
+
+// ----- MCP server (Phase C) -----
+
+export interface McpStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number | null;
+  token: string | null;
+  url: string | null;
+}
+
+export const mcpStatus = () => invoke<McpStatus>("mcp_status");
+export const mcpStart = () => invoke<McpStatus>("mcp_start");
+export const mcpStop = () => invoke<McpStatus>("mcp_stop");
+export const mcpRotateToken = () => invoke<McpStatus>("mcp_rotate_token");
+
+export interface McpClient {
+  id: string;
+  name: string;
+  version: string | null;
+  client_info: string | null;
+  consent_read: boolean | null;
+  consent_write: boolean | null;
+  first_seen_at: string;
+  last_seen_at: string | null;
+  revoked_at: string | null;
+}
+
+export const mcpListClients = () => invoke<McpClient[]>("mcp_list_clients");
+export const mcpSetConsent = (
+  clientId: string,
+  consentRead: boolean,
+  consentWrite: boolean,
+) =>
+  invoke<void>("mcp_set_consent", {
+    clientId,
+    consentRead,
+    consentWrite,
+  });
+export const mcpRevokeClient = (clientId: string) =>
+  invoke<void>("mcp_revoke_client", { clientId });
+
+export type ProposalKind = "propose" | "correct";
+export type ProposalStatus = "pending" | "accepted" | "rejected" | "superseded";
+
+export interface Proposal {
+  id: string;
+  client_id: string;
+  kind: ProposalKind;
+  statement: string | null;
+  suggested_category: string | null;
+  suggested_confidence: number | null;
+  reasoning: string | null;
+  source: string | null;
+  target_belief_id: string | null;
+  suggested_status: string | null;
+  correction_reason: string | null;
+  status: ProposalStatus;
+  decided_at: string | null;
+  decided_belief_id: string | null;
+  created_at: string;
+}
+
+export interface AcceptProposalOverride {
+  statement?: string;
+  category?: string;
+  confidence?: number;
+  trustClass?: TrustClass;
+}
+
+export const mcpListProposals = (status?: ProposalStatus) =>
+  invoke<Proposal[]>("mcp_list_proposals", status ? { status } : {});
+
+export const mcpAcceptProposal = (
+  proposalId: string,
+  override?: AcceptProposalOverride,
+) =>
+  invoke<string>("mcp_accept_proposal", {
+    proposalId,
+    statement: override?.statement,
+    category: override?.category,
+    confidence: override?.confidence,
+    trustClass: override?.trustClass,
+  });
+
+export const mcpRejectProposal = (proposalId: string) =>
+  invoke<void>("mcp_reject_proposal", { proposalId });

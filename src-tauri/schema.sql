@@ -114,14 +114,20 @@ CREATE INDEX IF NOT EXISTS idx_belief_versions_belief ON belief_versions(belief_
 -- ============================================================================
 -- Provenance edges: each belief version points at the sources that produced
 -- or affected it. For summaries, sources are child beliefs (relation='summarizes').
--- source_type drives the foreign lookup: 'turn' -> messages, 'artifact' -> artifacts,
--- 'belief' -> beliefs. FK is not declared because the target varies.
+-- source_type drives the foreign lookup:
+--   'turn'       -> messages
+--   'artifact'   -> artifacts
+--   'belief'     -> beliefs
+--   'proposal'   -> belief_proposals (a user-accepted external proposal)
+--   'mcp_client' -> mcp_clients      (external AI that touched this version)
+-- FK is not declared because the target table varies.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS belief_provenance (
     id                TEXT PRIMARY KEY,
     belief_version_id TEXT NOT NULL REFERENCES belief_versions(id) ON DELETE CASCADE,
-    source_type       TEXT NOT NULL CHECK (source_type IN ('turn','artifact','belief')),
+    source_type       TEXT NOT NULL CHECK (source_type IN
+                        ('turn','artifact','belief','proposal','mcp_client')),
     source_id         TEXT NOT NULL,
     relation          TEXT NOT NULL CHECK (relation IN
                         ('extracted_from','reinforced_by','contradicted_by',
@@ -178,6 +184,68 @@ CREATE TABLE IF NOT EXISTS extraction_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_extraction_log_turn ON extraction_log(turn_id);
+
+-- ============================================================================
+-- MCP server (Phase C).
+-- An external AI tool (Claude Desktop, Cursor, Witsy, ...) connects via the
+-- Model Context Protocol and is recorded here. Consent is per-client and
+-- split into two buckets: read (list/get/search) and write (propose/correct).
+-- Each is NULL until the user decides, then 0 (denied) or 1 (granted).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS mcp_clients (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,    -- from MCP initialize: clientInfo.name
+    version       TEXT,                    -- clientInfo.version
+    client_info   TEXT,                    -- full JSON for forensics
+    consent_read  INTEGER,                 -- NULL=pending, 0=denied, 1=granted
+    consent_write INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT,
+    revoked_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_clients_name ON mcp_clients(name);
+
+-- External proposals live OUTSIDE the ledger until accepted, so retrieval,
+-- the map, and summarization never see unreviewed external claims. On accept,
+-- a real belief is materialized via the existing Ledger path with provenance
+-- (source_type='proposal', source_id=<belief_proposals.id>).
+--
+-- kind='propose' rows carry a new statement; kind='correct' rows point at
+-- target_belief_id and suggest a status change with a reason.
+
+CREATE TABLE IF NOT EXISTS belief_proposals (
+    id                   TEXT PRIMARY KEY,
+    client_id            TEXT NOT NULL REFERENCES mcp_clients(id) ON DELETE CASCADE,
+    kind                 TEXT NOT NULL CHECK (kind IN ('propose','correct')),
+
+    -- propose fields
+    statement            TEXT,
+    suggested_category   TEXT,
+    suggested_confidence REAL CHECK (suggested_confidence IS NULL
+                                     OR (suggested_confidence >= 0.0
+                                         AND suggested_confidence <= 1.0)),
+    reasoning            TEXT,             -- AI's "why I'm proposing this"
+    source               TEXT,             -- AI's free-form source label
+
+    -- correct fields
+    target_belief_id     TEXT REFERENCES beliefs(id) ON DELETE SET NULL,
+    suggested_status     TEXT CHECK (suggested_status IS NULL OR suggested_status IN
+                                     ('contested','corrected','expired')),
+    correction_reason    TEXT,
+
+    -- lifecycle
+    status               TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (status IN ('pending','accepted','rejected','superseded')),
+    decided_at           TEXT,
+    decided_belief_id    TEXT REFERENCES beliefs(id) ON DELETE SET NULL,
+    created_at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposals_status ON belief_proposals(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_proposals_client ON belief_proposals(client_id);
+CREATE INDEX IF NOT EXISTS idx_proposals_target ON belief_proposals(target_belief_id);
 
 -- ============================================================================
 -- Embeddings (Phase 5).

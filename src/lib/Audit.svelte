@@ -8,11 +8,17 @@
     embedUnembeddedBeliefs,
     listMergeCandidates,
     mergeBeliefs,
+    mcpListProposals,
+    mcpListClients,
+    mcpAcceptProposal,
+    mcpRejectProposal,
     type AuditBelief,
     type BeliefDetail,
     type BeliefStatus,
     type TrustClass,
     type MergeCandidate,
+    type Proposal,
+    type McpClient,
   } from "./chat";
 
   interface Props {
@@ -105,6 +111,58 @@
       beliefs = await listBeliefsAudit();
     } finally {
       loading = false;
+    }
+    // Refresh the MCP inbox alongside — cheap (no network).
+    await refreshInbox();
+  }
+
+  // ---------- MCP Inbox (Phase C) ----------
+  let inbox: Proposal[] = $state([]);
+  let inboxClients = $state(new Map<string, McpClient>());
+  let inboxBusy: string | null = $state(null);
+  let inboxError: string | null = $state(null);
+
+  async function refreshInbox() {
+    try {
+      const [proposals, clients] = await Promise.all([
+        mcpListProposals("pending"),
+        mcpListClients(),
+      ]);
+      inbox = proposals;
+      inboxClients = new Map(clients.map((c) => [c.id, c]));
+      inboxError = null;
+    } catch (e: any) {
+      inboxError = e?.message ?? String(e);
+    }
+  }
+
+  function clientName(id: string): string {
+    return inboxClients.get(id)?.name ?? id.slice(0, 8);
+  }
+
+  async function acceptProposal(p: Proposal) {
+    inboxBusy = p.id;
+    inboxError = null;
+    try {
+      await mcpAcceptProposal(p.id);
+      await refresh();
+    } catch (e: any) {
+      inboxError = e?.message ?? String(e);
+    } finally {
+      inboxBusy = null;
+    }
+  }
+
+  async function rejectProposal(p: Proposal) {
+    inboxBusy = p.id;
+    inboxError = null;
+    try {
+      await mcpRejectProposal(p.id);
+      await refresh();
+    } catch (e: any) {
+      inboxError = e?.message ?? String(e);
+    } finally {
+      inboxBusy = null;
     }
   }
 
@@ -507,6 +565,85 @@
     {/if}
   </div>
 
+  <!-- MCP Inbox (Phase C) — pending proposals from external AIs -->
+  {#if inbox.length > 0 || inboxError}
+    <div class="px-3 py-2 border-b border-amber-300/40 dark:border-amber-700/30 bg-amber-50 dark:bg-amber-950/30">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-sm font-semibold flex items-center gap-2">
+          <span class="text-amber-700 dark:text-amber-400">📥 Inbox</span>
+          <span class="text-xs text-neutral-500">
+            {inbox.length} pending {inbox.length === 1 ? "proposal" : "proposals"} from external AIs
+          </span>
+        </div>
+      </div>
+      {#if inboxError}
+        <p class="text-xs text-red-500 mb-2">{inboxError}</p>
+      {/if}
+      <ul class="space-y-2">
+        {#each inbox as p (p.id)}
+          <li class="rounded-md bg-white dark:bg-neutral-900 border border-amber-300/50 dark:border-amber-700/40 p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-[11px] text-neutral-500">
+                <span class="font-medium text-amber-700 dark:text-amber-400">
+                  via MCP from {clientName(p.client_id)}
+                </span>
+                · {p.kind === "propose" ? "new belief" : "correction"}
+                · {new Date(p.created_at).toLocaleString()}
+              </div>
+            </div>
+            {#if p.kind === "propose"}
+              <div class="text-sm mb-1">{p.statement}</div>
+              <div class="text-[11px] text-neutral-500 mb-2 flex flex-wrap gap-2">
+                {#if p.suggested_category}
+                  <span>category: <code class="font-mono">{p.suggested_category}</code></span>
+                {/if}
+                {#if p.suggested_confidence !== null}
+                  <span>confidence: {(p.suggested_confidence * 100).toFixed(0)}%</span>
+                {/if}
+                {#if p.source}
+                  <span>source: {p.source}</span>
+                {/if}
+              </div>
+              {#if p.reasoning}
+                <div class="text-[11px] text-neutral-600 dark:text-neutral-400 italic mb-2 leading-snug">
+                  “{p.reasoning}”
+                </div>
+              {/if}
+            {:else}
+              <div class="text-sm mb-1">
+                Mark belief <code class="font-mono text-xs">{p.target_belief_id?.slice(0, 8)}…</code>
+                as <strong>{p.suggested_status}</strong>
+              </div>
+              {#if p.correction_reason}
+                <div class="text-[11px] text-neutral-600 dark:text-neutral-400 italic mb-2 leading-snug">
+                  “{p.correction_reason}”
+                </div>
+              {/if}
+            {/if}
+            <div class="flex gap-1.5">
+              <button
+                type="button"
+                onclick={() => acceptProposal(p)}
+                disabled={inboxBusy === p.id}
+                class="text-xs px-2 py-1 rounded-md pal-accent-bg text-white hover:opacity-90 disabled:opacity-50"
+              >
+                {inboxBusy === p.id ? "…" : "✓ Accept"}
+              </button>
+              <button
+                type="button"
+                onclick={() => rejectProposal(p)}
+                disabled={inboxBusy === p.id}
+                class="text-xs px-2 py-1 rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              >
+                ✗ Reject
+              </button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
+
   <!-- List -->
   <div class="flex-1 overflow-y-auto">
     {#if showMerges}
@@ -806,11 +943,26 @@
                         {#if v.provenance.length > 0}
                           <ul class="mt-1.5 space-y-1">
                             {#each v.provenance as p (p.source_id + p.relation)}
+                              {@const isMcp =
+                                p.source_type === "mcp_client" ||
+                                p.source_type === "proposal"}
                               <li
-                                class="text-[11px] text-neutral-500 border-l-2 border-violet-300 dark:border-violet-800 pl-2"
+                                class="text-[11px] pl-2 border-l-2
+                                       {isMcp
+                                         ? 'border-amber-400 dark:border-amber-600 text-amber-800 dark:text-amber-300'
+                                         : 'border-violet-300 dark:border-violet-800 text-neutral-500'}"
                               >
-                                <span class="font-medium">{p.relation}</span>
-                                ({p.source_type}){#if p.preview}: <span class="italic">{p.preview}</span>{/if}
+                                {#if isMcp}
+                                  <span class="font-medium">📥 {p.relation}</span>
+                                  {#if p.preview}
+                                    <span class="italic">{p.preview}</span>
+                                  {:else}
+                                    <span class="italic">({p.source_type})</span>
+                                  {/if}
+                                {:else}
+                                  <span class="font-medium">{p.relation}</span>
+                                  ({p.source_type}){#if p.preview}: <span class="italic">{p.preview}</span>{/if}
+                                {/if}
                               </li>
                             {/each}
                           </ul>
