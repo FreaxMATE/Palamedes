@@ -20,7 +20,7 @@ use std::sync::Arc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, InitializeRequestParam, InitializeResult,
+        CallToolResult, Content, Implementation, InitializeRequestParams, InitializeResult,
         ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
@@ -381,7 +381,7 @@ impl ServerHandler for PalamedesMcpHandler {
 
     async fn initialize(
         &self,
-        request: InitializeRequestParam,
+        request: InitializeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         // Upsert the client row + remember its id for this session. Read

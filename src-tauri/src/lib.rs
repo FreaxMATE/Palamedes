@@ -2817,6 +2817,31 @@ async fn mcp_rotate_token(state: State<'_, AppState>) -> Result<McpStatus, Strin
     mcp_status(state).await
 }
 
+/// Start the MCP HTTP server without launching the Tauri GUI. Used by the
+/// `palamedes-mcp-serve` binary when Cursor/Claude need the ledger but the
+/// desktop app isn't running.
+pub async fn headless_mcp_serve(data_dir: std::path::PathBuf) -> anyhow::Result<mcp::server::McpServerHandle> {
+    embeddings::register_vec_extension();
+    let db_path = data_dir.join("palamedes.db");
+    let db = Arc::new(Db::open(&db_path)?);
+    let client = NebiusClient::from_env()?;
+    let port: u16 = db
+        .get_setting("mcp_server_port")?
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5180);
+    let token = match db.get_setting("mcp_server_token")? {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let t = mcp::server::generate_token();
+            db.set_setting("mcp_server_token", &t)?;
+            t
+        }
+    };
+    db.set_setting("mcp_server_enabled", "true")?;
+    mcp::server::start(db, client, port, token).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = dotenvy::dotenv();
@@ -2837,11 +2862,15 @@ pub fn run() {
             let db_path = data_dir.join("palamedes.db");
             let db = Arc::new(Db::open(&db_path).expect("failed to open SQLite db"));
 
-            // Hold clones for the on-startup recap catch-up task. Spawned
-            // after `manage` so the main UI never blocks on it.
+            // Hold clones for the on-startup recap catch-up task and the
+            // MCP auto-start task. Both spawned after `manage` so the main
+            // UI never blocks on them.
             let recap_client = client.clone();
             let recap_db = db.clone();
             let recap_data_dir = data_dir.clone();
+            let mcp_client = client.clone();
+            let mcp_db = db.clone();
+            let mcp_handle = app.handle().clone();
 
             app.manage(AppState {
                 client,
@@ -2874,6 +2903,48 @@ pub fn run() {
                 match run_generate_recap(&recap_client, &recap_db, &recap_data_dir, &date).await {
                     Ok(_) => log::info!("startup recap catch-up wrote {}", path.display()),
                     Err(e) => log::warn!("startup recap catch-up failed (non-fatal): {}", e),
+                }
+            });
+
+            // MCP server auto-start: if `mcp_server_enabled=true` in
+            // settings, bind the HTTP+SSE listener in the background and
+            // stash the handle in AppState. Survives Tauri dev rebuilds
+            // and avoids the "click Start after every restart" friction.
+            // Non-fatal on failure — the user can still click Start.
+            tauri::async_runtime::spawn(async move {
+                let enabled = mcp_db
+                    .get_setting("mcp_server_enabled")
+                    .ok()
+                    .flatten()
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+                if !enabled {
+                    return;
+                }
+                let port: u16 = mcp_db
+                    .get_setting("mcp_server_port")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5180);
+                let token = match mcp_db.get_setting("mcp_server_token").ok().flatten() {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        log::warn!("mcp auto-start: enabled=true but token missing; skipping");
+                        return;
+                    }
+                };
+                log::info!("mcp auto-start: binding on 127.0.0.1:{}", port);
+                match mcp::server::start(mcp_db, mcp_client, port, token).await {
+                    Ok(handle) => {
+                        log::info!("mcp server listening at {}", handle.url());
+                        let state = mcp_handle.state::<AppState>();
+                        *state.mcp_server.lock().await = Some(handle);
+                    }
+                    Err(e) => {
+                        log::warn!("mcp auto-start failed (non-fatal): {}", e);
+                    }
                 }
             });
 

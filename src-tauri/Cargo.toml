@@ -23,6 +23,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "palamedes-mcp"
 path = "src/bin/palamedes_mcp.rs"
 
+# Headless MCP HTTP server (no GUI). Opens the same SQLite ledger the Tauri
+# app uses and binds 127.0.0.1:<mcp_server_port> from settings.
+[[bin]]
+name = "palamedes-mcp-serve"
+path = "src/bin/palamedes_mcp_serve.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
