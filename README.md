@@ -9,8 +9,7 @@ grounded in your real situation.
 > **Status: pre-launch, dogfooding.** Public so the open Belief Schema MCP
 > standard has a public reference implementation. Feature-complete enough to
 > use day-to-day; the [Known limitations](#known-limitations) section is the
-> live punch list. Formal launch ~6 weeks out — see [docs/ANALYSIS.md](docs/ANALYSIS.md)
-> for the roadmap.
+> live punch list. Formal launch a few weeks out.
 
 ## Why
 
