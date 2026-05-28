@@ -3,6 +3,7 @@ mod chat_pipeline;
 mod confidence;
 mod db;
 mod embeddings;
+mod export;
 mod extraction;
 mod graph;
 mod ledger;
@@ -1673,6 +1674,42 @@ async fn audit_chain_recent(
     state.audit.recent(n).map_err(|e| e.to_string())
 }
 
+// ============================================================================
+// JSON ledger export / import.
+// ============================================================================
+
+/// Write the full belief ledger to `path` as a `palamedes.export.v1`
+/// envelope and audit-log the operation.
+#[tauri::command]
+async fn export_ledger(
+    state: State<'_, AppState>,
+    path: String,
+    include_embeddings: bool,
+) -> Result<export::ExportReport, String> {
+    let audit = state.audit.clone();
+    let path_buf = std::path::PathBuf::from(path);
+    state
+        .db
+        .with_conn(|conn| export::export_to_path(conn, &audit, &path_buf, include_embeddings))
+        .map_err(|e| e.to_string())
+}
+
+/// Replay a `palamedes.export.v1` envelope into the current install. Fails
+/// unless the target is empty or `replace=true` is passed.
+#[tauri::command]
+async fn import_ledger(
+    state: State<'_, AppState>,
+    path: String,
+    replace: bool,
+) -> Result<export::ImportReport, String> {
+    let audit = state.audit.clone();
+    let path_buf = std::path::PathBuf::from(path);
+    state
+        .db
+        .with_conn(|conn| export::import_from_path(conn, &audit, &path_buf, replace))
+        .map_err(|e| e.to_string())
+}
+
 /// Pending vec_beliefs dim swap, if any. Read at app startup so the UI
 /// can surface the situation. Closes the silent-data-loss gap flagged
 /// in docs/ANALYSIS.md §2.7.
@@ -1921,6 +1958,8 @@ pub fn run() {
             audit_chain_head,
             audit_chain_verify,
             audit_chain_recent,
+            export_ledger,
+            import_ledger,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

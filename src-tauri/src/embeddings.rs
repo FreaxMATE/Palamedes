@@ -93,6 +93,28 @@ pub fn vec_to_blob(v: &[f32]) -> Result<Vec<u8>> {
     Ok(v.as_bytes().to_vec())
 }
 
+/// Inverse of [`vec_to_blob`]. Used by the JSON export path to surface
+/// vectors as readable arrays in the envelope. Validates the byte length
+/// matches `EMBEDDING_DIM * 4` so a corrupt or wrong-dim blob fails loud
+/// instead of producing a misaligned slice.
+pub fn blob_to_vec(blob: &[u8]) -> Result<Vec<f32>> {
+    let expected = EMBEDDING_DIM * std::mem::size_of::<f32>();
+    if blob.len() != expected {
+        return Err(anyhow!(
+            "embedding blob is {} bytes, expected {} ({}d × 4 bytes)",
+            blob.len(),
+            expected,
+            EMBEDDING_DIM
+        ));
+    }
+    let mut out = Vec::with_capacity(EMBEDDING_DIM);
+    for chunk in blob.chunks_exact(4) {
+        let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
