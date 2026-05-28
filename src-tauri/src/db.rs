@@ -91,6 +91,10 @@ impl Db {
         // run; from v2 onward, schema changes ship as files under
         // ../migrations/ and entries in `MIGRATIONS` in migrations.rs.
         crate::migrations::run(&conn)?;
+        // After migration 0002, any pre-existing beliefs need their
+        // `uniq` column populated from `subject`. New inserts already
+        // write it; this pass catches the historical rows once.
+        backfill_belief_uniq(&conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["system_prompt", DEFAULT_SYSTEM_PROMPT],
@@ -727,6 +731,43 @@ pub struct DedupCandidate {
     pub statement: String,
     pub status: String,
     pub distance: f64,
+}
+
+/// Populate `beliefs.uniq` and `beliefs.last_observed_at` for any rows
+/// that pre-date migration 0002. Idempotent: only touches rows where
+/// `uniq IS NULL`. Per-row UPDATEs (not a single statement) because we
+/// compute the hash in Rust.
+fn backfill_belief_uniq(conn: &Connection) -> Result<()> {
+    // Skip cheaply on already-backfilled DBs (the typical case after the
+    // first launch on this version).
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM beliefs WHERE uniq IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if pending == 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, subject, created_at, last_reinforced_at
+           FROM beliefs WHERE uniq IS NULL",
+    )?;
+    let rows: Vec<(String, String, String, Option<String>)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (id, subject, created_at, last_reinforced_at) in rows {
+        let uniq = crate::ledger::compute_uniq(&subject);
+        let observed = last_reinforced_at.unwrap_or(created_at);
+        conn.execute(
+            "UPDATE beliefs SET uniq = ?1, last_observed_at = ?2 WHERE id = ?3",
+            params![uniq, observed, id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Parse the column dim out of a `vec_beliefs` CREATE statement.

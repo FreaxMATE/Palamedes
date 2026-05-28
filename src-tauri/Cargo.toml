@@ -1,9 +1,9 @@
 [package]
 name = "palamedes"
 version = "0.1.0"
-description = "Personal AI chat app with branching conversations"
+description = "Audit-grade AI memory — the AI that remembers what you've ruled out."
 authors = ["Konstantin Unruh"]
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/FreaxMATE/Palamedes"
 edition = "2021"
 rust-version = "1.77.2"
@@ -55,6 +55,7 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 sqlite-vec = "0.1"
 zerocopy = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
 
 # MCP server (Phase C). `rmcp` is Anthropic's official Rust SDK.
 # Features: server-side tool handlers + the streamable-HTTP transport

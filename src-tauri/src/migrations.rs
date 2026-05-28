@@ -41,13 +41,12 @@ pub struct Migration {
 /// Append new migrations to this slice. Order must be monotonic by `version`.
 /// Version 1 ("baseline") is implicit — never list it here.
 static MIGRATIONS: &[Migration] = &[
-    // Example for the next migration (week 2):
-    // Migration {
-    //     version: 2,
-    //     name: "audit_chain",
-    //     sql: include_str!("../migrations/0002_audit_chain.sql"),
-    //     flags: 0,
-    // },
+    Migration {
+        version: 2,
+        name: "belief_uniq_hash",
+        sql: include_str!("../migrations/0002_belief_uniq_hash.sql"),
+        flags: 0,
+    },
 ];
 
 /// Run pending migrations. Safe to call on every startup.
@@ -56,6 +55,14 @@ pub fn run(conn: &Connection) -> Result<()> {
     bootstrap_baseline_if_needed(conn)?;
 
     let current = current_version(conn)?;
+    // Caller is expected to have applied schema.sql before this. If they
+    // haven't (current_version is still 0 because bootstrap didn't find a
+    // beliefs table), applying migrations 2+ to a tableless DB would just
+    // produce confusing "no such table" errors. Skip safely — the next
+    // run() after schema.sql lands will bootstrap and apply.
+    if current == 0 {
+        return Ok(());
+    }
 
     // MIGRATIONS is sorted by version (enforced by the assertion below). We
     // walk it in order and skip anything already applied.
@@ -163,37 +170,57 @@ fn apply_migration(conn: &Connection, m: &Migration) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn fresh() -> Connection {
+    const SCHEMA: &str = include_str!("../schema.sql");
+
+    fn empty() -> Connection {
         Connection::open_in_memory().unwrap()
     }
 
+    fn baseline() -> Connection {
+        // Real v1 baseline — schema.sql applied.
+        crate::embeddings::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn
+    }
+
+    fn max_migration_version() -> i32 {
+        MIGRATIONS.last().map(|m| m.version).unwrap_or(1)
+    }
+
     #[test]
-    fn empty_db_records_no_baseline() {
-        let conn = fresh();
+    fn empty_db_with_no_tables_records_no_baseline() {
+        let conn = empty();
         run(&conn).unwrap();
         let v = current_version(&conn).unwrap();
         assert_eq!(v, 0, "fresh empty DB should be version 0, not 1");
     }
 
     #[test]
-    fn db_with_baseline_tables_gets_stamped_v1() {
-        let conn = fresh();
-        // Simulate a baseline DB: just need the `beliefs` table to exist.
-        conn.execute("CREATE TABLE beliefs (id TEXT PRIMARY KEY)", [])
-            .unwrap();
+    fn baseline_db_gets_stamped_and_advances_through_all_migrations() {
+        let conn = baseline();
         run(&conn).unwrap();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 1);
+        // Bootstrap stamps v1, then walks every pending migration.
+        assert_eq!(v, max_migration_version());
+        // Baseline row present alongside the migration rows.
+        let has_baseline: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM palamedes_schema_version WHERE version=1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_baseline);
     }
 
     #[test]
     fn idempotent_on_repeat_calls() {
-        let conn = fresh();
-        conn.execute("CREATE TABLE beliefs (id TEXT PRIMARY KEY)", [])
-            .unwrap();
+        let conn = baseline();
         run(&conn).unwrap();
         run(&conn).unwrap();
         run(&conn).unwrap();
+        // Exactly one row per applied version: 1 (baseline) + len(MIGRATIONS).
         let count: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM palamedes_schema_version",
@@ -201,6 +228,6 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "baseline row should only be inserted once");
+        assert_eq!(count, 1 + MIGRATIONS.len() as i32);
     }
 }

@@ -216,12 +216,15 @@ impl<'a> Ledger<'a> {
         let now = Utc::now().to_rfc3339();
         let belief_id = Uuid::new_v4().to_string();
         let version_id = Uuid::new_v4().to_string();
+        let uniq = compute_uniq(&spec.subject);
 
         self.conn.execute(
             "INSERT INTO beliefs (id, subject, category, current_version_id, status, trust_class,
                                    scope, scope_ref_id, level, parent_summary_id,
-                                   created_at, updated_at, last_reinforced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, NULL)",
+                                   created_at, updated_at, last_reinforced_at,
+                                   uniq, num_times, last_observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, NULL,
+                     ?12, 1, ?11)",
             params![
                 belief_id,
                 spec.subject,
@@ -234,6 +237,7 @@ impl<'a> Ledger<'a> {
                 spec.level,
                 spec.parent_summary_id,
                 now,
+                uniq,
             ],
         )?;
 
@@ -488,6 +492,72 @@ fn to_sqlite(e: &anyhow::Error) -> rusqlite::Error {
     )
 }
 
+/// SHA-256 of the canonicalized statement. Used as `beliefs.uniq` so chatty
+/// re-extractions of the same claim collapse to one row + a counter rather
+/// than producing N near-identical rows that auto-merge later has to reconcile.
+///
+/// Canonicalization is intentionally lossy: case, leading/trailing whitespace,
+/// internal whitespace runs, and a single terminal punctuation mark are all
+/// collapsed. This means "I prefer Vim" and "i prefer vim." hash the same;
+/// "I prefer Vim" and "I prefer Emacs" do not.
+pub fn compute_uniq(subject: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let canon = canonicalize_statement(subject);
+    let mut h = Sha256::new();
+    h.update(canon.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// See [`compute_uniq`] — exposed so a backfill pass or tests can verify
+/// canonicalization without going through the hash.
+pub fn canonicalize_statement(s: &str) -> String {
+    let trimmed = s.trim();
+    // Strip a single terminal sentence-ender if present.
+    let no_terminal = trimmed
+        .strip_suffix('.')
+        .or_else(|| trimmed.strip_suffix('!'))
+        .or_else(|| trimmed.strip_suffix('?'))
+        .unwrap_or(trimmed);
+    // Collapse internal whitespace runs to single spaces and lowercase.
+    no_terminal
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Bump the observation counters for an existing belief. Called by the
+/// extraction/dedupe pipeline when a re-statement of the same belief is
+/// observed (uniq match). Week-2's Beta(α,β) confidence reads `num_times`
+/// as the `recall_hit` count.
+#[allow(dead_code)] // First caller lands in week 2 with the Beta math wiring.
+pub fn bump_observation(conn: &Connection, belief_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE beliefs
+            SET num_times = num_times + 1,
+                last_observed_at = ?2
+          WHERE id = ?1",
+        params![belief_id, now],
+    )?;
+    Ok(())
+}
+
+/// Look up a belief by canonical-content hash. Returns the belief id if a
+/// row with this `uniq` exists; the dedupe path uses this as a cheap
+/// pre-check before falling back to embedding cosine.
+#[allow(dead_code)] // First caller lands in week 2 with the upsert wiring.
+pub fn find_by_uniq(conn: &Connection, uniq: &str) -> Result<Option<String>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM beliefs WHERE uniq = ?1 LIMIT 1",
+            params![uniq],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip tests — the 7 validation cases for Phase 1.
 // ---------------------------------------------------------------------------
@@ -502,6 +572,9 @@ mod tests {
         crate::embeddings::register_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        // Apply numbered migrations on top of the v1 baseline so tests
+        // see the schema the running app sees.
+        crate::migrations::run(&conn).unwrap();
         conn
     }
 
@@ -894,5 +967,138 @@ mod tests {
         assert_eq!(child_before.current_version_id, child_after.current_version_id);
         assert_eq!(child_before.status, child_after.status);
         assert_eq!(child_after.parent_summary_id.as_deref(), Some(summary.id.as_str()));
+    }
+
+    // -----------------------------------------------------------------
+    // uniq + observation counter (T4: Memori-inspired pattern)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn canonicalize_collapses_case_whitespace_and_terminal_punctuation() {
+        assert_eq!(canonicalize_statement("I Prefer Vim"), "i prefer vim");
+        assert_eq!(canonicalize_statement("  I prefer  Vim  "), "i prefer vim");
+        assert_eq!(canonicalize_statement("I prefer Vim."), "i prefer vim");
+        assert_eq!(canonicalize_statement("I prefer Vim!"), "i prefer vim");
+        assert_eq!(canonicalize_statement("I prefer Vim?"), "i prefer vim");
+        // Internal punctuation is left alone.
+        assert_eq!(canonicalize_statement("uses Vim, not Emacs"), "uses vim, not emacs");
+    }
+
+    #[test]
+    fn compute_uniq_is_stable_across_cosmetic_variants() {
+        let a = compute_uniq("User prefers Vim");
+        let b = compute_uniq("  user prefers vim.  ");
+        let c = compute_uniq("USER PREFERS VIM!");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        // 64 hex characters = SHA-256.
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compute_uniq_differs_on_real_content_change() {
+        assert_ne!(
+            compute_uniq("User prefers Vim"),
+            compute_uniq("User prefers Emacs")
+        );
+    }
+
+    #[test]
+    fn insert_belief_populates_uniq_and_num_times() {
+        let conn = fresh_conn();
+        let ledger = Ledger::new(&conn);
+        let (b, _) = ledger
+            .insert_belief(NewBelief {
+                subject: "User prefers SQLite".into(),
+                category: None,
+                status: Status::Inferred,
+                trust_class: TrustClass::Inferred,
+                scope: Scope::Global,
+                scope_ref_id: None,
+                level: 0,
+                parent_summary_id: None,
+                initial_version: NewVersion {
+                    statement: "User prefers SQLite".into(),
+                    confidence: None,
+                    reason: None,
+                    editor: Editor::Ai,
+                },
+            })
+            .unwrap();
+        let row: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT uniq, num_times, last_observed_at FROM beliefs WHERE id = ?1",
+                params![b.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, compute_uniq("User prefers SQLite"));
+        assert_eq!(row.1, 1);
+        assert!(row.2.is_some());
+    }
+
+    #[test]
+    fn bump_observation_increments_counter_and_timestamp() {
+        let conn = fresh_conn();
+        let ledger = Ledger::new(&conn);
+        let (b, _) = ledger
+            .insert_belief(NewBelief {
+                subject: "User reads HN daily".into(),
+                category: None,
+                status: Status::Inferred,
+                trust_class: TrustClass::Inferred,
+                scope: Scope::Global,
+                scope_ref_id: None,
+                level: 0,
+                parent_summary_id: None,
+                initial_version: NewVersion {
+                    statement: "User reads HN daily".into(),
+                    confidence: None,
+                    reason: None,
+                    editor: Editor::Ai,
+                },
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        bump_observation(&conn, &b.id).unwrap();
+        bump_observation(&conn, &b.id).unwrap();
+        let (n, last): (i64, String) = conn
+            .query_row(
+                "SELECT num_times, last_observed_at FROM beliefs WHERE id = ?1",
+                params![b.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 3, "1 initial + 2 bumps");
+        assert!(last > b.created_at);
+    }
+
+    #[test]
+    fn find_by_uniq_locates_existing_row_and_misses_for_strangers() {
+        let conn = fresh_conn();
+        let ledger = Ledger::new(&conn);
+        let (b, _) = ledger
+            .insert_belief(NewBelief {
+                subject: "User ships in Rust".into(),
+                category: None,
+                status: Status::Inferred,
+                trust_class: TrustClass::Inferred,
+                scope: Scope::Global,
+                scope_ref_id: None,
+                level: 0,
+                parent_summary_id: None,
+                initial_version: NewVersion {
+                    statement: "User ships in Rust".into(),
+                    confidence: None,
+                    reason: None,
+                    editor: Editor::Ai,
+                },
+            })
+            .unwrap();
+        let hit = find_by_uniq(&conn, &compute_uniq("user ships in rust.")).unwrap();
+        assert_eq!(hit.as_deref(), Some(b.id.as_str()));
+        let miss = find_by_uniq(&conn, &compute_uniq("User ships in Go")).unwrap();
+        assert!(miss.is_none());
     }
 }

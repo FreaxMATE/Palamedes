@@ -489,6 +489,7 @@ mod tests {
         crate::embeddings::register_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        crate::migrations::run(&conn).unwrap();
         conn
     }
 
