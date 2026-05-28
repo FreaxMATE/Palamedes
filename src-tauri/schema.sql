@@ -324,3 +324,30 @@ CREATE TABLE IF NOT EXISTS belief_positions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_belief_positions_version ON belief_positions(projection_version);
+
+-- ============================================================================
+-- MCP read audit log.
+-- Every successful invocation of a read tool (list_beliefs, get_belief,
+-- search_beliefs) appends one row, attributed to the connecting MCP client.
+-- Two jobs:
+--   1. Rate limit — a client granted consent_read could otherwise enumerate
+--      the whole ledger via repeated calls. The audit module counts rows
+--      from the last 24h per client and blocks new reads above the budget
+--      (settings.mcp_read_limit_per_day; default 1000).
+--   2. Forensic surface — the Audit panel (week 4) shows the user exactly
+--      which beliefs each client has read, when, and via which tool.
+-- See src/mcp/audit.rs for caps on query and returned_ids size.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS mcp_read_log (
+    id            TEXT PRIMARY KEY,
+    client_id     TEXT NOT NULL REFERENCES mcp_clients(id) ON DELETE CASCADE,
+    tool          TEXT NOT NULL CHECK (tool IN ('list_beliefs','get_belief','search_beliefs')),
+    query         TEXT,                       -- JSON of input args, capped server-side
+    result_count  INTEGER NOT NULL DEFAULT 0,
+    returned_ids  TEXT,                       -- JSON array of belief ids, capped server-side
+    created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_read_log_client_time
+    ON mcp_read_log(client_id, created_at);

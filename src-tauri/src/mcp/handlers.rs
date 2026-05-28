@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 use crate::db::Db;
 use crate::embeddings;
 use crate::ledger::Ledger;
-use crate::mcp::{consent, proposals};
+use crate::mcp::{audit, consent, proposals};
 use crate::nebius::NebiusClient;
 
 #[derive(Clone)]
@@ -65,7 +65,7 @@ impl PalamedesMcpHandler {
 // Tool input + output types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListBeliefsInput {
     /// Filter by trust_class: asserted | inferred | hypothesized | summary.
     pub trust_class: Option<String>,
@@ -77,13 +77,13 @@ pub struct ListBeliefsInput {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GetBeliefInput {
     /// The belief's UUID.
     pub id: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchBeliefsInput {
     /// Natural-language query. Embedded via the user's configured
     /// embedding model, then matched against the corpus by cosine.
@@ -140,12 +140,18 @@ impl PalamedesMcpHandler {
         &self,
         Parameters(input): Parameters<ListBeliefsInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.require_consent(false).await?;
+        let client_id = self.gate_read().await?;
+        let input_json = serde_json::to_string(&input).ok();
         let limit = input.limit.unwrap_or(50).clamp(1, 500);
         let beliefs = self
             .db
             .with_conn(|conn| list_beliefs_sql(conn, &input, limit))
             .map_err(|e| internal(format!("list_beliefs failed: {e}")))?;
+        let ids: Vec<String> = beliefs
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
+            .collect();
+        self.log_read(&client_id, "list_beliefs", input_json.as_deref(), &ids);
         ok_json(&json!({ "beliefs": beliefs, "count": beliefs.len() }))
     }
 
@@ -156,7 +162,9 @@ impl PalamedesMcpHandler {
         &self,
         Parameters(input): Parameters<GetBeliefInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.require_consent(false).await?;
+        let client_id = self.gate_read().await?;
+        let input_json = serde_json::to_string(&input).ok();
+        let target_id = input.id.clone();
         let detail = self
             .db
             .with_conn(|conn| {
@@ -185,6 +193,7 @@ impl PalamedesMcpHandler {
                 None,
             ));
         }
+        self.log_read(&client_id, "get_belief", input_json.as_deref(), &[target_id]);
         ok_json(&detail)
     }
 
@@ -195,7 +204,8 @@ impl PalamedesMcpHandler {
         &self,
         Parameters(input): Parameters<SearchBeliefsInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.require_consent(false).await?;
+        let client_id = self.gate_read().await?;
+        let input_json = serde_json::to_string(&input).ok();
         if input.query.trim().is_empty() {
             return Err(McpError::invalid_params("query must be non-empty", None));
         }
@@ -253,6 +263,8 @@ impl PalamedesMcpHandler {
             })
             .map_err(|e| internal(format!("hydrate failed: {e}")))?;
 
+        let ids: Vec<String> = hits.iter().map(|h| h.belief_id.clone()).collect();
+        self.log_read(&client_id, "search_beliefs", input_json.as_deref(), &ids);
         ok_json(&json!({ "matches": hydrated, "count": hydrated.len() }))
     }
 
@@ -325,6 +337,30 @@ impl PalamedesMcpHandler {
 impl PalamedesMcpHandler {
     async fn require_client_id(&self) -> Option<String> {
         self.client_id.read().await.clone()
+    }
+
+    /// Combined gate for read tools: enforces consent, resolves the
+    /// client_id, then checks the per-client 24h read budget. Returns the
+    /// resolved client_id so the caller can attach it to the audit log
+    /// entry it writes after the work completes.
+    async fn gate_read(&self) -> Result<String, McpError> {
+        self.require_consent(false).await?;
+        let client_id = self
+            .require_client_id()
+            .await
+            .ok_or_else(|| internal("MCP initialize did not establish a client_id"))?;
+        self.db
+            .with_conn(|conn| audit::check_rate_limit(conn, &client_id))
+            .map_err(|e| McpError::invalid_request(format!("{e}"), None))?;
+        Ok(client_id)
+    }
+
+    /// Append a row to the read audit log. Best-effort — a failure to log
+    /// does not fail the tool call (the caller already has the data).
+    fn log_read(&self, client_id: &str, tool: &str, input_json: Option<&str>, ids: &[String]) {
+        let _ = self
+            .db
+            .with_conn(|conn| audit::log_read(conn, client_id, tool, input_json, ids));
     }
 
     /// Block this tool call unless the connecting MCP client is consented

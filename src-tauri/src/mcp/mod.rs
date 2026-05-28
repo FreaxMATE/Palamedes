@@ -9,11 +9,13 @@
 //! Wire layout:
 //! - `proposals` — CRUD on `belief_proposals` + accept materialization
 //! - `consent`   — per-client consent state, lookup + decisions
+//! - `audit`     — read-tool audit log + per-client rate limit
 //! - `handlers`  — the 5 rmcp tool handlers (Day 3-4)
 //! - `server`    — axum HTTP+SSE host, bearer-token middleware (Day 3-5)
 //!
 //! See `.plans/PHASE_C.md` for the full design + timeline.
 
+pub mod audit;
 pub mod consent;
 pub mod handlers;
 pub mod proposals;

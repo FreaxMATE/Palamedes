@@ -144,6 +144,17 @@ impl Db {
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["mcp_server_port", "5180"],
         )?;
+        // Per-MCP-client read budget over a sliding 24h window. The audit
+        // module reads this on every call; see src/mcp/audit.rs. Default
+        // 1000 — high enough for a normal agent session, low enough that
+        // a malicious client can't enumerate the whole ledger overnight.
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            params![
+                "mcp_read_limit_per_day",
+                crate::mcp::audit::DEFAULT_READ_LIMIT_PER_DAY.to_string()
+            ],
+        )?;
         // Migrate the previous default (Qwen3-Embedding-0.6B was a guess that
         // turned out not to be hosted on Nebius) to the actual SOTA option.
         // Any user-picked model is left alone.
