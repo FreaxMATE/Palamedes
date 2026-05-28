@@ -1,3 +1,4 @@
+mod audit;
 mod chat_pipeline;
 mod confidence;
 mod db;
@@ -55,6 +56,10 @@ pub struct ChatMessage {
 pub struct AppState {
     client: NebiusClient,
     db: Arc<Db>,
+    /// Tamper-evident chain in a separate SQLite file (`audit.db` sibling
+    /// of `palamedes.db`). Survives main-DB corruption; week-4 adds an
+    /// Ed25519 signature over its head.
+    audit: Arc<audit::AuditDb>,
     active_streams: Mutex<HashMap<String, CancellationToken>>,
     data_dir: std::path::PathBuf,
     /// MCP server handle when running. None when disabled / stopped.
@@ -1635,6 +1640,39 @@ async fn mcp_revoke_client(state: State<'_, AppState>, client_id: String) -> Res
         .map_err(|e| e.to_string())
 }
 
+// ============================================================================
+// Audit chain — tamper-evident operation log.
+// ============================================================================
+
+/// Latest row in the audit chain. `None` on a brand-new install before
+/// any operation has been logged.
+#[tauri::command]
+async fn audit_chain_head(
+    state: State<'_, AppState>,
+) -> Result<Option<audit::AuditHead>, String> {
+    state.audit.head().map_err(|e| e.to_string())
+}
+
+/// Walk the whole chain and re-derive every hash. UI shows the result
+/// as a green/red badge with the failing seq + reason on tamper.
+#[tauri::command]
+async fn audit_chain_verify(
+    state: State<'_, AppState>,
+) -> Result<audit::VerifyReport, String> {
+    state.audit.verify_integrity().map_err(|e| e.to_string())
+}
+
+/// Most-recent entries for the Audit panel surface. Capped server-side
+/// at 500 so the UI never has to deal with huge payloads.
+#[tauri::command]
+async fn audit_chain_recent(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<audit::AuditEntry>, String> {
+    let n = limit.unwrap_or(100).clamp(1, 500);
+    state.audit.recent(n).map_err(|e| e.to_string())
+}
+
 /// Pending vec_beliefs dim swap, if any. Read at app startup so the UI
 /// can surface the situation. Closes the silent-data-loss gap flagged
 /// in docs/ANALYSIS.md §2.7.
@@ -1688,6 +1726,12 @@ pub async fn headless_mcp_serve(data_dir: std::path::PathBuf) -> anyhow::Result<
     embeddings::register_vec_extension();
     let db_path = data_dir.join("palamedes.db");
     let db = Arc::new(Db::open(&db_path)?);
+    let audit_path = data_dir.join("audit.db");
+    let _audit = Arc::new(audit::AuditDb::open(&audit_path)?);
+    // _audit is held but not yet threaded into the headless MCP server.
+    // The MCP handlers don't see AppState in this mode; once we add an
+    // audit-aware constructor for PalamedesMcpHandler (week-2 follow-up),
+    // this binding becomes active.
     let client = NebiusClient::from_env()?;
     let port: u16 = db
         .get_setting("mcp_server_port")?
@@ -1725,6 +1769,11 @@ pub fn run() {
                 .expect("no app data dir");
             let db_path = data_dir.join("palamedes.db");
             let db = Arc::new(Db::open(&db_path).expect("failed to open SQLite db"));
+            let audit_path = data_dir.join("audit.db");
+            let audit = Arc::new(
+                audit::AuditDb::open(&audit_path)
+                    .expect("failed to open audit chain db"),
+            );
 
             // Hold clones for the on-startup recap catch-up task and the
             // MCP auto-start task. Both spawned after `manage` so the main
@@ -1739,6 +1788,7 @@ pub fn run() {
             app.manage(AppState {
                 client,
                 db,
+                audit,
                 active_streams: Mutex::new(HashMap::new()),
                 data_dir,
                 mcp_server: tokio::sync::Mutex::new(None),
@@ -1868,6 +1918,9 @@ pub fn run() {
             get_embedding_swap_state,
             confirm_embedding_swap,
             dismiss_embedding_swap,
+            audit_chain_head,
+            audit_chain_verify,
+            audit_chain_recent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
