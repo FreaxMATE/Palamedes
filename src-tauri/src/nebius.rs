@@ -60,11 +60,16 @@ pub enum StreamPiece {
 /// response string (useful for logging when parsing fails).
 pub struct ExtractionOutcome {
     pub drafts: Vec<BeliefDraft>,
+    /// Retained so the extraction-log row can record what the model actually
+    /// returned when parsing fails; not read on the happy path.
+    #[allow(dead_code)]
     pub raw_response: String,
 }
 
 pub struct SummarizationOutcome {
     pub summaries: Vec<SummaryDraft>,
+    /// Retained for logging on parse failure; not read on the happy path.
+    #[allow(dead_code)]
     pub raw_response: String,
 }
 

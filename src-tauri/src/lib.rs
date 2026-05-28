@@ -1,54 +1,56 @@
+mod chat_pipeline;
+mod confidence;
 mod db;
 mod embeddings;
 mod extraction;
+mod graph;
 mod ledger;
 mod mcp;
+mod merge;
 mod nebius;
 mod recap;
 mod summarization;
 
-use db::{find_top_dedup_match, Artifact, Conversation, Db, Message as DbMessage, RetrievedBelief};
+// Streaming chat + retrieval + receipts + embed/label backfill live in
+// chat_pipeline.rs; bring its Tauri commands into scope so the
+// `generate_handler!` macro can reference them unqualified.
+use chat_pipeline::{
+    cancel_stream, embed_unembedded_beliefs, regenerate, regenerate_belief_labels, send_message,
+};
+
+// Memory-map commands live in graph.rs; bring them into scope so the
+// `generate_handler!` macro can reference them unqualified.
+use graph::{
+    get_belief_embeddings, get_graph_edges_extended, get_graph_snapshot,
+    get_turns_for_belief, save_belief_positions,
+};
+
+// Merge / dedup commands live in merge.rs.
+use merge::{
+    auto_merge_duplicates, dismiss_merge_candidate, list_merge_candidates, merge_all_candidates,
+    merge_beliefs, recent_merges, run_auto_merge, undo_merge,
+};
+// Internal merge helpers used by the tests at the bottom of this file.
+#[cfg(test)]
+use merge::MergeCandidate;
+#[cfg(test)]
+use merge::{merge_in_tx, pick_keeper, undo_merge_in_conn};
+
+use db::{find_top_dedup_match, Artifact, Conversation, Db, Message as DbMessage};
 use extraction::TurnContext;
 use ledger::{Editor, Ledger, NewBelief, NewProvenance, NewVersion, ProvenanceRelation, Scope, SourceType, Status, TrustClass};
-use nebius::{Message, NebiusClient, Role, StreamPiece};
-use rusqlite::{params, OptionalExtension};
+use nebius::NebiusClient;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{Manager, State};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
-}
-
-#[derive(Serialize, Clone)]
-struct StreamChunk {
-    stream_id: String,
-    delta: String,
-}
-
-/// Reasoning chunks travel a separate event lane so the frontend can render
-/// them in a collapsible "thinking" panel without contaminating the visible
-/// content. Only emitted by reasoning models (Kimi K2.5, DeepSeek-V3.2).
-#[derive(Serialize, Clone)]
-struct StreamReasoning {
-    stream_id: String,
-    delta: String,
-}
-
-#[derive(Serialize, Clone)]
-struct StreamDone {
-    stream_id: String,
-    message_id: String,
-}
-
-#[derive(Serialize, Clone)]
-struct StreamError {
-    stream_id: String,
-    error: String,
 }
 
 pub struct AppState {
@@ -65,7 +67,7 @@ pub struct AppState {
 /// What the extracted beliefs are extracted *from*. A chat turn carries the
 /// user's message id; a captured note carries the artifact id.
 #[derive(Debug, Clone)]
-enum ExtractionSource {
+pub(crate) enum ExtractionSource {
     Turn(String),
     Artifact(String),
 }
@@ -94,8 +96,9 @@ impl ExtractionSource {
 
 /// Kick off background belief extraction. Never blocks the UI and never
 /// propagates errors back to the user — anything that goes wrong is written
-/// to `extraction_log`.
-fn spawn_extraction(
+/// to `extraction_log`. Called from `chat_pipeline::send_message` and from
+/// `capture_note` below.
+pub(crate) fn spawn_extraction(
     db: Arc<Db>,
     client: NebiusClient,
     model: String,
@@ -118,6 +121,9 @@ fn spawn_extraction(
             }
         };
 
+        // Keep the user's text so we can verify "asserted" claims are actually
+        // grounded in their own words before trusting that trust class.
+        let user_text = user_content.clone();
         let ctx = TurnContext {
             user_content,
             assistant_content,
@@ -238,10 +244,30 @@ fn spawn_extraction(
                     continue;
                 }
 
-                // Genuinely new belief.
-                let trust_class = match d.trust_class.as_str() {
+                // Genuinely new belief. Map the model's claimed trust class,
+                // then VERIFY "asserted": a directly-stated belief must be
+                // backed by a verbatim quote from the user. If the model claims
+                // "asserted" without a grounded quote it is over-claiming, so we
+                // demote to "inferred" — the audit thesis rests on "asserted"
+                // being something you can actually check against the source.
+                let claimed = match d.trust_class.as_str() {
                     "asserted" => TrustClass::Asserted,
+                    "hypothesized" => TrustClass::Hypothesized,
                     _ => TrustClass::Inferred,
+                };
+                let trust_class = if claimed == TrustClass::Asserted {
+                    let grounded = d
+                        .evidence_quote
+                        .as_deref()
+                        .map(|q| extraction::is_grounded(q, &user_text))
+                        .unwrap_or(false);
+                    if grounded {
+                        TrustClass::Asserted
+                    } else {
+                        TrustClass::Inferred
+                    }
+                } else {
+                    claimed
                 };
                 let status = match trust_class {
                     TrustClass::Asserted => Status::Asserted,
@@ -258,7 +284,9 @@ fn spawn_extraction(
                     parent_summary_id: None,
                     initial_version: NewVersion {
                         statement: d.statement.clone(),
-                        confidence: d.confidence,
+                        // Leaf beliefs never store confidence — it is derived
+                        // structurally at read time (see confidence.rs).
+                        confidence: None,
                         reason: d.evidence_quote.clone(),
                         editor: Editor::Ai,
                     },
@@ -332,6 +360,17 @@ fn spawn_extraction(
                     });
                     futures::future::join_all(label_futures).await;
                 }
+
+                // Background dedup: collapse any near-identical beliefs the new
+                // extractions created. Best-effort — a failure here never rolls
+                // back the beliefs that were just written.
+                if inserted_new > 0 {
+                    match run_auto_merge(&db) {
+                        Ok(n) if n > 0 => eprintln!("auto-merged {} duplicate belief(s)", n),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("auto-merge skipped: {}", e),
+                    }
+                }
             }
             Err(e) => {
                 let _ = db.log_extraction(
@@ -344,29 +383,6 @@ fn spawn_extraction(
             }
         }
     });
-}
-
-fn to_nebius_messages(history: &[DbMessage], system_prompt: Option<String>) -> Vec<Message> {
-    let mut out = Vec::with_capacity(history.len() + 1);
-    if let Some(sp) = system_prompt {
-        out.push(Message {
-            role: Role::System,
-            content: sp,
-        });
-    }
-    for m in history {
-        let role = match m.role.as_str() {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "system" => Role::System,
-            _ => Role::User,
-        };
-        out.push(Message {
-            role,
-            content: m.content.clone(),
-        });
-    }
-    out
 }
 
 // ---------- conversation / message commands ----------
@@ -475,554 +491,20 @@ async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> 
     state.client.list_models().await.map_err(|e| e.to_string())
 }
 
-// ---------- streaming ----------
+// ---------- structural confidence ----------
 
-#[tauri::command]
-async fn send_message(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    stream_id: String,
-    conversation_id: String,
-    parent_id: Option<String>,
-    user_message_id: String,
-    assistant_message_id: String,
-    user_content: String,
-) -> Result<(), String> {
-    let base_system_prompt = state
-        .db
-        .get_setting("system_prompt")
-        .map_err(|e| e.to_string())?;
-    let model = state
-        .db
-        .get_setting("model")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "moonshotai/Kimi-K2.5".to_string());
-
-    // 1. Persist the user message as a child of `parent_id`, using the id from the frontend.
-    let user_msg = state
-        .db
-        .insert_message_with_id(
-            &user_message_id,
-            &conversation_id,
-            parent_id.as_deref(),
-            "user",
-            &user_content,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-
-    // Retrieve relevant memories. Best-effort: if embeddings aren't ready yet,
-    // this returns an empty list and we fall through to a bare prompt.
-    let retrieved = retrieve_for_query(&state.db, &state.client, &user_content).await;
-    let memory_block = render_memory_block(&retrieved);
-    let system_prompt = base_system_prompt.map(|sp| {
-        let date_line = format!("Today's date: {}.", chrono::Utc::now().format("%Y-%m-%d"));
-        match &memory_block {
-            Some(mem) => format!("{}\n\n{}\n{}", sp, mem, date_line),
-            None => format!("{}\n\n{}", sp, date_line),
-        }
-    });
-
-    // 2. Build the history: the path from root to (and including) this new user msg.
-    let history = state
-        .db
-        .get_path_to(&user_msg.id)
-        .map_err(|e| e.to_string())?;
-
-    // 3. Create an empty assistant message as a child of the user message, with the frontend-provided id.
-    let assistant_msg = state
-        .db
-        .insert_message_with_id(
-            &assistant_message_id,
-            &conversation_id,
-            Some(&user_msg.id),
-            "assistant",
-            "",
-            Some(&model),
-        )
-        .map_err(|e| e.to_string())?;
-
-    // 4. Register cancellation + kick off the stream.
-    let cancel = CancellationToken::new();
-    state
-        .active_streams
-        .lock()
-        .unwrap()
-        .insert(stream_id.clone(), cancel.clone());
-
-    let messages = to_nebius_messages(&history, system_prompt);
-    let app_clone = app.clone();
-    let emit_id = stream_id.clone();
-    let assistant_id = assistant_msg.id.clone();
-
-    let accumulated = std::sync::Arc::new(Mutex::new(String::new()));
-    let accumulated_clone = accumulated.clone();
-
-    let result = state
-        .client
-        .stream_chat(&model, messages, cancel, |piece| match piece {
-            StreamPiece::Content(delta) => {
-                accumulated_clone.lock().unwrap().push_str(&delta);
-                let _ = app_clone.emit(
-                    "stream_chunk",
-                    StreamChunk {
-                        stream_id: emit_id.clone(),
-                        delta,
-                    },
-                );
-            }
-            StreamPiece::Reasoning(delta) => {
-                let _ = app_clone.emit(
-                    "stream_reasoning",
-                    StreamReasoning {
-                        stream_id: emit_id.clone(),
-                        delta,
-                    },
-                );
-            }
-        })
-        .await;
-
-    state.active_streams.lock().unwrap().remove(&stream_id);
-
-    // 5. Save whatever we accumulated (even on cancel) and emit terminal event.
-    let final_content = accumulated.lock().unwrap().clone();
-    let _ = state.db.update_message_content(&assistant_id, &final_content);
-
-    // 6. Persist recall receipts: which memories grounded this reply.
-    if result.is_ok() && !final_content.trim().is_empty() {
-        write_receipts(&state.db, &assistant_id, &retrieved);
-    }
-
-    // 7. Kick off belief extraction in the background (fire-and-forget).
-    //    Only on success, only if we have meaningful content.
-    if result.is_ok() && !final_content.trim().is_empty() {
-        spawn_extraction(
-            state.db.clone(),
-            state.client.clone(),
-            model.clone(),
-            ExtractionSource::Turn(user_msg.id.clone()),
-            user_content.clone(),
-            final_content.clone(),
-        );
-    }
-
-    match result {
-        Ok(()) => {
-            let _ = app.emit(
-                "stream_done",
-                StreamDone {
-                    stream_id: stream_id.clone(),
-                    message_id: assistant_id,
-                },
-            );
-            Ok(())
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = app.emit(
-                "stream_error",
-                StreamError {
-                    stream_id: stream_id.clone(),
-                    error: msg.clone(),
-                },
-            );
-            Err(msg)
-        }
-    }
-}
-
-#[tauri::command]
-async fn regenerate(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    stream_id: String,
-    assistant_message_id: String,
-    new_assistant_message_id: String,
-) -> Result<(), String> {
-    // Find the assistant message → its parent is the user msg whose history we reuse.
-    let path = state
-        .db
-        .get_path_to(&assistant_message_id)
-        .map_err(|e| e.to_string())?;
-    let assistant = path
-        .last()
-        .cloned()
-        .ok_or_else(|| "assistant message not found".to_string())?;
-    if assistant.role != "assistant" {
-        return Err("can only regenerate assistant messages".into());
-    }
-    let parent_id = assistant
-        .parent_id
-        .clone()
-        .ok_or_else(|| "assistant has no parent".to_string())?;
-    let conversation_id = assistant.conversation_id.clone();
-
-    let base_system_prompt = state
-        .db
-        .get_setting("system_prompt")
-        .map_err(|e| e.to_string())?;
-    let model = state
-        .db
-        .get_setting("model")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "moonshotai/Kimi-K2.5".to_string());
-
-    // History = path from root to (and including) the user msg parent.
-    let history = state.db.get_path_to(&parent_id).map_err(|e| e.to_string())?;
-
-    // Re-retrieve memories against the original user prompt so the new reply
-    // gets the same grounding as a fresh send_message would.
-    let user_query = history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    let retrieved = retrieve_for_query(&state.db, &state.client, &user_query).await;
-    let memory_block = render_memory_block(&retrieved);
-    let system_prompt = base_system_prompt.map(|sp| {
-        let date_line = format!("Today's date: {}.", chrono::Utc::now().format("%Y-%m-%d"));
-        match &memory_block {
-            Some(mem) => format!("{}\n\n{}\n{}", sp, mem, date_line),
-            None => format!("{}\n\n{}", sp, date_line),
-        }
-    });
-
-    // New assistant sibling.
-    let new_assistant = state
-        .db
-        .insert_message_with_id(
-            &new_assistant_message_id,
-            &conversation_id,
-            Some(&parent_id),
-            "assistant",
-            "",
-            Some(&model),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let cancel = CancellationToken::new();
-    state
-        .active_streams
-        .lock()
-        .unwrap()
-        .insert(stream_id.clone(), cancel.clone());
-
-    let messages = to_nebius_messages(&history, system_prompt);
-    let app_clone = app.clone();
-    let emit_id = stream_id.clone();
-    let new_assistant_id = new_assistant.id.clone();
-    let accumulated = std::sync::Arc::new(Mutex::new(String::new()));
-    let accumulated_clone = accumulated.clone();
-
-    let result = state
-        .client
-        .stream_chat(&model, messages, cancel, |piece| match piece {
-            StreamPiece::Content(delta) => {
-                accumulated_clone.lock().unwrap().push_str(&delta);
-                let _ = app_clone.emit(
-                    "stream_chunk",
-                    StreamChunk {
-                        stream_id: emit_id.clone(),
-                        delta,
-                    },
-                );
-            }
-            StreamPiece::Reasoning(delta) => {
-                let _ = app_clone.emit(
-                    "stream_reasoning",
-                    StreamReasoning {
-                        stream_id: emit_id.clone(),
-                        delta,
-                    },
-                );
-            }
-        })
-        .await;
-
-    state.active_streams.lock().unwrap().remove(&stream_id);
-
-    let final_content = accumulated.lock().unwrap().clone();
-    let _ = state
-        .db
-        .update_message_content(&new_assistant_id, &final_content);
-
-    if result.is_ok() && !final_content.trim().is_empty() {
-        write_receipts(&state.db, &new_assistant_id, &retrieved);
-    }
-
-    // No belief extraction on regenerate: the user turn is identical to the one
-    // already extracted from, so re-running would just duplicate beliefs.
-
-    match result {
-        Ok(()) => {
-            let _ = app.emit(
-                "stream_done",
-                StreamDone {
-                    stream_id: stream_id.clone(),
-                    message_id: new_assistant_id,
-                },
-            );
-            Ok(())
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = app.emit(
-                "stream_error",
-                StreamError {
-                    stream_id: stream_id.clone(),
-                    error: msg.clone(),
-                },
-            );
-            Err(msg)
-        }
-    }
-}
-
-#[tauri::command]
-fn cancel_stream(state: State<'_, AppState>, stream_id: String) -> Result<(), String> {
-    if let Some(token) = state.active_streams.lock().unwrap().remove(&stream_id) {
-        token.cancel();
-    }
-    Ok(())
-}
-
-// ---------- retrieval ----------
-
-const RETRIEVAL_K: usize = 10;
-
-/// Format retrieved beliefs as a memory block to prepend to the system prompt.
-/// Returns None if there are no retrievals — caller falls back to bare prompt.
-fn render_memory_block(retrieved: &[RetrievedBelief]) -> Option<String> {
-    if retrieved.is_empty() {
-        return None;
-    }
-    let mut lines = String::from(
-        "Memories that may be relevant to the current turn (use only if applicable; \
-do not parrot them; the user can audit and correct any of these):\n",
-    );
-    for r in retrieved {
-        let badge = match r.trust_class.as_str() {
-            "asserted" => "🔒 asserted",
-            "inferred" => "🧠 inferred",
-            "hypothesized" => "❓ hypothesized",
-            "summary" => "Σ summary",
-            other => other,
-        };
-        lines.push_str(&format!("- [{}] {}\n", badge, r.statement));
-    }
-    Some(lines)
-}
-
-/// Retrieve top-K beliefs for a query string. Embeds the query against the
-/// configured embedding model, normalizes, queries vec_beliefs, and drops
-/// matches below the user-configured cosine threshold so off-topic turns
-/// don't drag random memories into the system prompt. Failures (e.g. no
-/// embeddings yet) silently return an empty list — retrieval is best-effort.
-async fn retrieve_for_query(
-    db: &Arc<Db>,
-    client: &NebiusClient,
-    query: &str,
-) -> Vec<RetrievedBelief> {
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-    let model = match db.get_setting("embedding_model").ok().flatten() {
-        Some(m) => m,
-        None => embeddings::DEFAULT_EMBEDDING_MODEL.to_string(),
-    };
-    let mut q = match client.embed_query(&model, query).await {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    if q.len() != embeddings::EMBEDDING_DIM {
-        return Vec::new();
-    }
-    embeddings::normalize(&mut q);
-
-    let min_cosine: f64 = db
-        .get_setting("retrieval_min_cosine")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(embeddings::DEFAULT_RETRIEVAL_MIN_COSINE);
-
-    let mut hits = db.retrieve_top_k(&q, RETRIEVAL_K).unwrap_or_default();
-    hits.retain(|r| embeddings::cosine_from_l2(r.distance) >= min_cosine);
-    hits
-}
-
-/// Write recall_receipts rows linking a turn to the beliefs that grounded it.
-fn write_receipts(db: &Db, turn_id: &str, retrieved: &[RetrievedBelief]) {
-    if retrieved.is_empty() {
-        return;
-    }
-    let _ = db.with_conn(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        for (i, r) in retrieved.iter().enumerate() {
-            // Cosine similarity from L2 distance of normalized vectors.
-            let weight = embeddings::cosine_from_l2(r.distance).max(0.0);
-            tx.execute(
-                "INSERT INTO recall_receipts (id, turn_id, belief_id, belief_version_id, weight, rank)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    turn_id,
-                    r.belief_id,
-                    r.version_id,
-                    weight,
-                    (i as i64) + 1,
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    });
-}
-
-// ---------- embeddings ----------
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EmbedReport {
-    pub embedded: i32,
-    pub failed: i32,
-    /// The first error message encountered, if any. Surfaced in the UI toast
-    /// so misconfigured embedding models are diagnosable without diving into
-    /// the SQLite logs.
-    pub first_error: Option<String>,
-    /// Embedding model that was used for this run.
-    pub model: String,
-}
-
-#[tauri::command]
-async fn embed_unembedded_beliefs(state: State<'_, AppState>) -> Result<EmbedReport, String> {
-    let pending = state
-        .db
-        .list_unembedded_beliefs()
-        .map_err(|e| e.to_string())?;
-
-    let model = state
-        .db
-        .get_setting("embedding_model")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| embeddings::DEFAULT_EMBEDDING_MODEL.to_string());
-
-    let mut report = EmbedReport {
-        model: model.clone(),
-        ..Default::default()
-    };
-
-    if pending.is_empty() {
-        return Ok(report);
-    }
-
-    for (id, statement) in pending {
-        match state.client.embed(&model, &statement).await {
-            Ok(mut v) => {
-                if v.len() != embeddings::EMBEDDING_DIM {
-                    report.failed += 1;
-                    if report.first_error.is_none() {
-                        report.first_error = Some(format!(
-                            "dim mismatch: got {}, expected {}",
-                            v.len(),
-                            embeddings::EMBEDDING_DIM
-                        ));
-                    }
-                    continue;
-                }
-                embeddings::normalize(&mut v);
-                match state.db.upsert_embedding(&id, &v) {
-                    Ok(()) => report.embedded += 1,
-                    Err(e) => {
-                        report.failed += 1;
-                        if report.first_error.is_none() {
-                            report.first_error = Some(format!("upsert failed: {}", e));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                report.failed += 1;
-                if report.first_error.is_none() {
-                    report.first_error = Some(format!("{}", e));
-                }
-            }
-        }
-    }
-    Ok(report)
-}
-
-// ---------- label backfill ----------
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LabelBackfillReport {
-    pub labeled: i32,
-    pub failed: i32,
-    pub first_error: Option<String>,
-    pub model: String,
-}
-
-/// Generate a 1–4 word label for every unlabeled belief. Cheap LLM call per
-/// belief; runs them in batches of 8 in parallel to keep wall-clock low.
-#[tauri::command]
-async fn regenerate_belief_labels(state: State<'_, AppState>) -> Result<LabelBackfillReport, String> {
-    let pending = state
-        .db
-        .list_unlabeled_beliefs()
-        .map_err(|e| e.to_string())?;
-
-    // The label model is hardcoded inside `extract_label` (a small,
-    // non-thinking instruct model). The chat-model setting is irrelevant
-    // here — labels can't run through reasoning models. We still report
-    // the chat model name for backwards-compat with the UI.
-    let model = state
-        .db
-        .get_setting("model")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "moonshotai/Kimi-K2.5".to_string());
-
-    let mut report = LabelBackfillReport {
-        model,
-        ..Default::default()
-    };
-
-    if pending.is_empty() {
-        return Ok(report);
-    }
-
-    const BATCH: usize = 8;
-    for chunk in pending.chunks(BATCH) {
-        let futures = chunk.iter().map(|(id, statement)| {
-            let c = state.client.clone();
-            let db = state.db.clone();
-            let id = id.clone();
-            let statement = statement.clone();
-            async move {
-                let label = c
-                    .extract_label(&statement)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                db.set_belief_label(&id, &label)
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-        });
-        let results = futures::future::join_all(futures).await;
-        for r in results {
-            match r {
-                Ok(()) => report.labeled += 1,
-                Err(e) => {
-                    report.failed += 1;
-                    if report.first_error.is_none() {
-                        report.first_error = Some(e);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(report)
+/// Build a belief's read-time effective confidence (structural score + coarse
+/// bucket) from its row primitives. This is the ONLY path a confidence value
+/// reaches the UI — the model never supplies one. `stored` is NULL for leaves
+/// and the Rust-computed aggregate for summaries. Delegates to `confidence`.
+fn effective_conf(
+    trust_class: &str,
+    reinforced_count: i64,
+    created_at: &str,
+    last_reinforced_at: Option<&str>,
+    stored: Option<f64>,
+) -> confidence::EffectiveConfidence {
+    confidence::effective_for(trust_class, reinforced_count, created_at, last_reinforced_at, stored)
 }
 
 // ---------- audit (Belief Ledger) ----------
@@ -1031,7 +513,11 @@ async fn regenerate_belief_labels(state: State<'_, AppState>) -> Result<LabelBac
 pub struct AuditBelief {
     pub id: String,
     pub statement: String,
-    pub confidence: f64,
+    /// Structural confidence score [0,1], derived at read time — never
+    /// self-reported by the model. The UI shows `confidence_bucket`, not this.
+    pub effective_confidence: f64,
+    /// Coarse bucket: "strong" | "moderate" | "tentative".
+    pub confidence_bucket: String,
     pub category: Option<String>,
     pub status: String,
     pub trust_class: String,
@@ -1052,6 +538,9 @@ pub struct ProvenanceItem {
     pub source_id: String,
     pub relation: String,
     pub preview: Option<String>,
+    /// For `source_type == "turn"`: the conversation that message belongs to,
+    /// so the audit UI can deep-link to the exact source utterance.
+    pub conversation_id: Option<String>,
     pub created_at: String,
 }
 
@@ -1059,7 +548,9 @@ pub struct ProvenanceItem {
 pub struct VersionItem {
     pub version_num: i32,
     pub statement: String,
-    pub confidence: f64,
+    // Confidence is not versioned — it is structural and computed live. The
+    // version history shows what changed (statement/status) and why, not a
+    // per-version number.
     pub reason: Option<String>,
     pub editor: String,
     pub created_at: String,
@@ -1070,6 +561,43 @@ pub struct VersionItem {
 pub struct BeliefDetail {
     pub belief: AuditBelief,
     pub versions: Vec<VersionItem>,
+}
+
+/// Map an audit row to an `AuditBelief`, computing structural confidence.
+/// Both the list and detail queries select the same 14 columns in this order:
+/// id, statement, confidence, category, status, trust_class, level,
+/// parent_summary_id, prov_count, ver_count, reinforced_count, created_at,
+/// updated_at, last_reinforced_at.
+fn row_to_audit_belief(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditBelief> {
+    let trust_class: String = r.get(5)?;
+    let stored: Option<f64> = r.get(2)?;
+    let reinforced_count: i64 = r.get(10)?;
+    let created_at: String = r.get(11)?;
+    let updated_at: String = r.get(12)?;
+    let last_reinforced_at: Option<String> = r.get(13)?;
+    let eff = effective_conf(
+        &trust_class,
+        reinforced_count,
+        &created_at,
+        last_reinforced_at.as_deref(),
+        stored,
+    );
+    Ok(AuditBelief {
+        id: r.get(0)?,
+        statement: r.get(1)?,
+        effective_confidence: eff.score,
+        confidence_bucket: eff.bucket.as_str().to_string(),
+        category: r.get(3)?,
+        status: r.get(4)?,
+        trust_class,
+        level: r.get(6)?,
+        parent_summary_id: r.get(7)?,
+        provenance_count: r.get(8)?,
+        version_count: r.get(9)?,
+        reinforced_count,
+        created_at,
+        updated_at,
+    })
 }
 
 #[tauri::command]
@@ -1087,28 +615,12 @@ fn list_beliefs_audit(state: State<'_, AppState>) -> Result<Vec<AuditBelief>, St
                           JOIN belief_versions bv2 ON bv2.id = bp2.belief_version_id
                           WHERE bv2.belief_id = b.id
                             AND bp2.relation = 'reinforced_by') AS reinforced_count,
-                        b.created_at, b.updated_at
+                        b.created_at, b.updated_at, b.last_reinforced_at
                  FROM beliefs b
                  JOIN belief_versions bv ON bv.id = b.current_version_id
                  ORDER BY b.updated_at DESC",
             )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(AuditBelief {
-                    id: r.get(0)?,
-                    statement: r.get(1)?,
-                    confidence: r.get(2)?,
-                    category: r.get(3)?,
-                    status: r.get(4)?,
-                    trust_class: r.get(5)?,
-                    level: r.get(6)?,
-                    parent_summary_id: r.get(7)?,
-                    provenance_count: r.get(8)?,
-                    version_count: r.get(9)?,
-                    reinforced_count: r.get(10)?,
-                    created_at: r.get(11)?,
-                    updated_at: r.get(12)?,
-                })
-            })?;
+            let rows = stmt.query_map([], |r| Ok(row_to_audit_belief(r)?))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .map_err(|e| e.to_string())
@@ -1129,28 +641,12 @@ fn get_belief_detail(state: State<'_, AppState>, id: String) -> Result<BeliefDet
                           JOIN belief_versions bv2 ON bv2.id = bp2.belief_version_id
                           WHERE bv2.belief_id = b.id
                             AND bp2.relation = 'reinforced_by') AS reinforced_count,
-                        b.created_at, b.updated_at
+                        b.created_at, b.updated_at, b.last_reinforced_at
                  FROM beliefs b
                  JOIN belief_versions bv ON bv.id = b.current_version_id
                  WHERE b.id = ?1",
                 params![id],
-                |r| {
-                    Ok(AuditBelief {
-                        id: r.get(0)?,
-                        statement: r.get(1)?,
-                        confidence: r.get(2)?,
-                        category: r.get(3)?,
-                        status: r.get(4)?,
-                        trust_class: r.get(5)?,
-                        level: r.get(6)?,
-                        parent_summary_id: r.get(7)?,
-                        provenance_count: r.get(8)?,
-                        version_count: r.get(9)?,
-                        reinforced_count: r.get(10)?,
-                        created_at: r.get(11)?,
-                        updated_at: r.get(12)?,
-                    })
-                },
+                row_to_audit_belief,
             )?;
 
             // All versions, oldest first.
@@ -1164,7 +660,6 @@ fn get_belief_detail(state: State<'_, AppState>, id: String) -> Result<BeliefDet
                     let item = VersionItem {
                         version_num: r.get(1)?,
                         statement: r.get(2)?,
-                        confidence: r.get(3)?,
                         reason: r.get(4)?,
                         editor: r.get(5)?,
                         created_at: r.get(6)?,
@@ -1253,11 +748,24 @@ fn get_belief_detail(state: State<'_, AppState>, id: String) -> Result<BeliefDet
                             .ok(),
                         _ => None,
                     };
+                    // For chat turns, resolve the conversation so the UI can
+                    // jump straight to the source message.
+                    let conversation_id = if source_type == "turn" {
+                        conn.query_row(
+                            "SELECT conversation_id FROM messages WHERE id = ?1",
+                            params![source_id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
                     v.provenance.push(ProvenanceItem {
                         source_type,
                         source_id,
                         relation,
                         preview,
+                        conversation_id,
                         created_at,
                     });
                 }
@@ -1279,7 +787,8 @@ pub struct UpdateBeliefArgs {
     pub new_status: Option<String>,
     pub new_trust_class: Option<String>,
     pub new_statement: Option<String>,
-    pub new_confidence: Option<f64>,
+    // No new_confidence: confidence is structural and not user-settable as a
+    // number. Users change trust_class / status / statement; the score follows.
     pub reason: Option<String>,
     pub blocklist_pattern: Option<String>,
 }
@@ -1291,8 +800,10 @@ fn update_belief(state: State<'_, AppState>, args: UpdateBeliefArgs) -> Result<(
         .with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
 
-            // Load current version so optional fields default to existing values.
-            let (cur_statement, cur_confidence): (String, f64) = tx.query_row(
+            // Load current version so optional fields default to existing
+            // values. Confidence (NULL for leaves, an aggregate for summaries)
+            // is carried forward untouched — it is never user-set as a number.
+            let (cur_statement, cur_confidence): (String, Option<f64>) = tx.query_row(
                 "SELECT bv.statement, bv.confidence
                  FROM beliefs b JOIN belief_versions bv ON bv.id = b.current_version_id
                  WHERE b.id = ?1",
@@ -1311,7 +822,7 @@ fn update_belief(state: State<'_, AppState>, args: UpdateBeliefArgs) -> Result<(
                 &args.id,
                 NewVersion {
                     statement: args.new_statement.unwrap_or(cur_statement),
-                    confidence: args.new_confidence.unwrap_or(cur_confidence),
+                    confidence: cur_confidence,
                     reason: args.reason.clone(),
                     editor: Editor::User,
                 },
@@ -1487,22 +998,41 @@ pub(crate) async fn run_generate_recap(
                 .collect::<Result<Vec<_>, _>>()?;
 
             let mut beliefs_stmt = conn.prepare(
-                "SELECT bv.statement, b.category, bv.confidence, b.status, b.trust_class
+                "SELECT bv.statement, b.category, b.trust_class, b.status,
+                        (SELECT COUNT(*) FROM belief_provenance bp
+                          JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
+                          WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count,
+                        b.created_at, b.last_reinforced_at, bv.confidence
                  FROM beliefs b
                  JOIN belief_versions bv ON bv.id = b.current_version_id
                  WHERE substr(b.created_at, 1, 10) = ?1
                  ORDER BY
                     CASE b.status WHEN 'inferred' THEN 0 ELSE 1 END,
-                    bv.confidence DESC",
+                    b.created_at DESC",
             )?;
             let beliefs: Vec<recap::BeliefRow> = beliefs_stmt
                 .query_map(params![date], |r| {
+                    let statement: String = r.get(0)?;
+                    let category: Option<String> = r.get(1)?;
+                    let trust_class: String = r.get(2)?;
+                    let status: String = r.get(3)?;
+                    let reinforced_count: i64 = r.get(4)?;
+                    let created_at: String = r.get(5)?;
+                    let last_reinforced_at: Option<String> = r.get(6)?;
+                    let stored: Option<f64> = r.get(7)?;
+                    let eff = effective_conf(
+                        &trust_class,
+                        reinforced_count,
+                        &created_at,
+                        last_reinforced_at.as_deref(),
+                        stored,
+                    );
                     Ok(recap::BeliefRow {
-                        statement: r.get(0)?,
-                        category: r.get(1)?,
-                        confidence: r.get(2)?,
-                        status: r.get(3)?,
-                        trust_class: r.get(4)?,
+                        statement,
+                        category,
+                        confidence_bucket: eff.bucket.as_str().to_string(),
+                        status,
+                        trust_class,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1594,727 +1124,7 @@ fn get_receipts_for_turn(
         .map_err(|e| e.to_string())
 }
 
-// ---------- memory map (2D projection of embeddings) ----------
 
-/// What the renderer needs per belief: enough to draw + tooltip + click-through.
-/// Position is None when the belief hasn't been projected yet (new since the
-/// last UMAP run); the frontend collects those and triggers a re-projection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphBelief {
-    pub id: String,
-    pub statement: String,
-    pub label: Option<String>,
-    pub category: Option<String>,
-    pub status: String,
-    pub trust_class: String,
-    pub level: i32,
-    pub parent_summary_id: Option<String>,
-    pub confidence: f64,
-    pub reinforced_count: i64,
-    pub created_at: String,
-    pub last_reinforced_at: Option<String>,
-    pub x: Option<f64>,
-    pub y: Option<f64>,
-    pub has_embedding: bool,
-}
-
-/// Typed edge between two beliefs. `kind` matches the belief_provenance
-/// relation vocabulary plus two synthetic kinds (`hierarchy`, `knn`,
-/// `co_recall`) derived from other tables.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphEdge {
-    pub source_id: String,
-    pub target_id: String,
-    pub kind: String,
-    pub weight: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphSnapshot {
-    pub beliefs: Vec<GraphBelief>,
-    pub edges: Vec<GraphEdge>,
-    pub projection_version: i64,
-}
-
-#[tauri::command]
-fn get_graph_snapshot(state: State<'_, AppState>) -> Result<GraphSnapshot, String> {
-    state
-        .db
-        .with_conn(|conn| {
-            let projection_version: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(projection_version), 0) FROM belief_positions",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-
-            let mut stmt = conn.prepare(
-                "SELECT b.id, bv.statement, b.label, b.category, b.status, b.trust_class,
-                        b.level, b.parent_summary_id, bv.confidence,
-                        (SELECT COUNT(*) FROM belief_provenance bp
-                          JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
-                          WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count,
-                        b.created_at, b.last_reinforced_at,
-                        p.x, p.y,
-                        EXISTS(SELECT 1 FROM vec_beliefs v WHERE v.belief_id = b.id) AS has_embedding
-                 FROM beliefs b
-                 JOIN belief_versions bv ON bv.id = b.current_version_id
-                 LEFT JOIN belief_positions p ON p.belief_id = b.id
-                 ORDER BY b.created_at ASC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(GraphBelief {
-                    id: r.get(0)?,
-                    statement: r.get(1)?,
-                    label: r.get(2)?,
-                    category: r.get(3)?,
-                    status: r.get(4)?,
-                    trust_class: r.get(5)?,
-                    level: r.get(6)?,
-                    parent_summary_id: r.get(7)?,
-                    confidence: r.get(8)?,
-                    reinforced_count: r.get(9)?,
-                    created_at: r.get(10)?,
-                    last_reinforced_at: r.get(11)?,
-                    x: r.get(12)?,
-                    y: r.get(13)?,
-                    has_embedding: r.get::<_, i64>(14)? != 0,
-                })
-            })?;
-            let beliefs = rows.collect::<Result<Vec<_>, _>>()?;
-
-            // Build the visible-id set so we don't emit edges to beliefs the
-            // frontend won't draw (corrected/blocked/expired filter above).
-            let visible: std::collections::HashSet<String> =
-                beliefs.iter().map(|b| b.id.clone()).collect();
-            let mut edges: Vec<GraphEdge> = Vec::new();
-
-            // Hierarchy edges: leaf -> parent_summary_id (level 0 -> 1+).
-            // Drawn child→parent so the renderer can curve them upward.
-            let mut h_stmt = conn.prepare(
-                "SELECT id, parent_summary_id
-                 FROM beliefs
-                 WHERE parent_summary_id IS NOT NULL",
-            )?;
-            let h_rows = h_stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in h_rows {
-                let (child, parent) = row?;
-                if visible.contains(&child) && visible.contains(&parent) {
-                    edges.push(GraphEdge {
-                        source_id: child,
-                        target_id: parent,
-                        kind: "hierarchy".to_string(),
-                        weight: 1.0,
-                    });
-                }
-            }
-
-            // Provenance edges: belief→belief edges from the current version
-            // of each belief. We collapse duplicates by (source, target, kind)
-            // and weight by row count (matters for reinforced_by).
-            let mut p_stmt = conn.prepare(
-                "SELECT bv.belief_id  AS source_id,
-                        bp.source_id  AS target_id,
-                        bp.relation
-                 FROM belief_provenance bp
-                 JOIN belief_versions bv ON bv.id = bp.belief_version_id
-                 JOIN beliefs b ON b.id = bv.belief_id
-                 WHERE bp.source_type = 'belief'
-                   AND bv.id = b.current_version_id",
-            )?;
-            let p_rows = p_stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-            let mut seen: HashMap<(String, String, String), f64> = HashMap::new();
-            for row in p_rows {
-                let (src, tgt, rel) = row?;
-                if !visible.contains(&src) || !visible.contains(&tgt) {
-                    continue;
-                }
-                *seen.entry((src, tgt, rel)).or_insert(0.0) += 1.0;
-            }
-            for ((src, tgt, rel), w) in seen {
-                edges.push(GraphEdge {
-                    source_id: src,
-                    target_id: tgt,
-                    kind: rel,
-                    weight: w,
-                });
-            }
-
-            Ok(GraphSnapshot {
-                beliefs,
-                edges,
-                projection_version,
-            })
-        })
-        .map_err(|e| e.to_string())
-}
-
-/// One row per turn that retrieved this belief — used by the receipts
-/// spotlight ("show me turns where this belief was cited").
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnForBelief {
-    pub turn_id: String,
-    pub conversation_id: String,
-    pub conversation_title: String,
-    pub preview: String,
-    pub created_at: String,
-    pub weight: f64,
-    pub rank: i64,
-}
-
-#[tauri::command]
-fn get_turns_for_belief(
-    state: State<'_, AppState>,
-    belief_id: String,
-) -> Result<Vec<TurnForBelief>, String> {
-    state
-        .db
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT m.id, m.conversation_id, c.title, m.content, m.created_at,
-                        r.weight, r.rank
-                 FROM recall_receipts r
-                 JOIN messages m       ON m.id = r.turn_id
-                 JOIN conversations c  ON c.id = m.conversation_id
-                 WHERE r.belief_id = ?1
-                 ORDER BY m.created_at DESC
-                 LIMIT 100",
-            )?;
-            let rows = stmt.query_map(params![belief_id], |r| {
-                let content: String = r.get(3)?;
-                let preview: String = content.chars().take(120).collect();
-                Ok(TurnForBelief {
-                    turn_id: r.get(0)?,
-                    conversation_id: r.get(1)?,
-                    conversation_title: r.get(2)?,
-                    preview,
-                    created_at: r.get(4)?,
-                    weight: r.get(5)?,
-                    rank: r.get(6)?,
-                })
-            })?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .map_err(|e| e.to_string())
-}
-
-/// Heavier signals fetched on demand: top-k semantic neighbors for every
-/// embedded belief, and pairs of beliefs cited together in the same turn
-/// (`recall_receipts`). Off the cold path so the map opens fast.
-#[tauri::command]
-fn get_graph_edges_extended(
-    state: State<'_, AppState>,
-    knn_k: Option<usize>,
-) -> Result<Vec<GraphEdge>, String> {
-    let k = knn_k.unwrap_or(3).clamp(1, 8);
-    state
-        .db
-        .with_conn(|conn| {
-            let mut edges: Vec<GraphEdge> = Vec::new();
-
-            // Co-recall edges: beliefs that appear together in the same turn's
-            // recall_receipts. Symmetric, so emit (a < b) once.
-            let mut cr_stmt = conn.prepare(
-                "SELECT r1.belief_id, r2.belief_id, COUNT(*) AS w
-                 FROM recall_receipts r1
-                 JOIN recall_receipts r2
-                   ON r1.turn_id = r2.turn_id
-                  AND r1.belief_id < r2.belief_id
-                 JOIN beliefs b1 ON b1.id = r1.belief_id
-                 JOIN beliefs b2 ON b2.id = r2.belief_id
-                 WHERE b1.status NOT IN ('blocked')
-                   AND b2.status NOT IN ('blocked')
-                 GROUP BY r1.belief_id, r2.belief_id",
-            )?;
-            let cr_rows = cr_stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)? as f64,
-                ))
-            })?;
-            for row in cr_rows {
-                let (a, b, w) = row?;
-                edges.push(GraphEdge {
-                    source_id: a,
-                    target_id: b,
-                    kind: "co_recall".to_string(),
-                    weight: w,
-                });
-            }
-
-            // kNN edges: for each embedded belief, the top-k nearest neighbors
-            // by L2 over the normalized vectors (rank-equivalent to cosine).
-            // We over-fetch k+1 (drop self) and skip self-loops by id.
-            let mut ids_stmt = conn.prepare(
-                "SELECT b.id FROM beliefs b
-                 JOIN vec_beliefs v ON v.belief_id = b.id
-                 WHERE b.status NOT IN ('blocked')",
-            )?;
-            let ids: Vec<String> = ids_stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let mut emb_stmt = conn.prepare(
-                "SELECT embedding FROM vec_beliefs WHERE belief_id = ?1",
-            )?;
-            let mut nn_stmt = conn.prepare(
-                "SELECT v.belief_id, v.distance
-                 FROM (
-                     SELECT belief_id, distance
-                     FROM vec_beliefs
-                     WHERE embedding MATCH ?1 AND k = ?2
-                     ORDER BY distance
-                 ) v
-                 JOIN beliefs b ON b.id = v.belief_id
-                 WHERE b.status NOT IN ('blocked')
-                 ORDER BY v.distance ASC",
-            )?;
-
-            let mut knn_seen: std::collections::HashSet<(String, String)> =
-                std::collections::HashSet::new();
-
-            for src in &ids {
-                let blob: Option<Vec<u8>> = emb_stmt
-                    .query_row(params![src], |r| r.get::<_, Vec<u8>>(0))
-                    .optional()?;
-                let Some(query_blob) = blob else { continue };
-
-                // Pull k+2 to leave room for self + status filtering.
-                let oversample = (k as i64) + 2;
-                let nn_rows = nn_stmt.query_map(params![query_blob, oversample], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-                })?;
-
-                let mut taken = 0usize;
-                for row in nn_rows {
-                    let (tgt, dist) = row?;
-                    if &tgt == src {
-                        continue;
-                    }
-                    // Symmetric undirected edge — store with min id first to dedupe.
-                    let pair = if src < &tgt {
-                        (src.clone(), tgt.clone())
-                    } else {
-                        (tgt.clone(), src.clone())
-                    };
-                    if knn_seen.contains(&pair) {
-                        continue;
-                    }
-                    knn_seen.insert(pair.clone());
-
-                    // Convert L2 on unit vectors to cosine ∈ [-1, 1] for weight.
-                    let cosine = embeddings::cosine_from_l2(dist);
-                    edges.push(GraphEdge {
-                        source_id: pair.0,
-                        target_id: pair.1,
-                        kind: "knn".to_string(),
-                        weight: cosine,
-                    });
-                    taken += 1;
-                    if taken >= k {
-                        break;
-                    }
-                }
-            }
-
-            Ok(edges)
-        })
-        .map_err(|e| e.to_string())
-}
-
-/// Return raw embedding vectors for the requested belief ids. Used by the
-/// frontend before running UMAP. We ship vectors as Vec<f32> (JSON arrays);
-/// for ~1000 beliefs at 4096-dim that's ~16MB JSON over Tauri IPC, which is
-/// fine for an on-demand projection trigger.
-#[tauri::command]
-fn get_belief_embeddings(
-    state: State<'_, AppState>,
-    belief_ids: Vec<String>,
-) -> Result<Vec<(String, Vec<f32>)>, String> {
-    if belief_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    state
-        .db
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT embedding FROM vec_beliefs WHERE belief_id = ?1",
-            )?;
-            let mut out: Vec<(String, Vec<f32>)> = Vec::with_capacity(belief_ids.len());
-            for id in &belief_ids {
-                let blob: Option<Vec<u8>> = stmt
-                    .query_row(params![id], |r| r.get::<_, Vec<u8>>(0))
-                    .optional()?;
-                let Some(bytes) = blob else { continue };
-                if bytes.len() != embeddings::EMBEDDING_DIM * 4 {
-                    continue;
-                }
-                let mut v: Vec<f32> = Vec::with_capacity(embeddings::EMBEDDING_DIM);
-                for chunk in bytes.chunks_exact(4) {
-                    let mut buf = [0u8; 4];
-                    buf.copy_from_slice(chunk);
-                    v.push(f32::from_le_bytes(buf));
-                }
-                out.push((id.clone(), v));
-            }
-            Ok(out)
-        })
-        .map_err(|e| e.to_string())
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PositionUpdate {
-    pub belief_id: String,
-    pub x: f64,
-    pub y: f64,
-}
-
-/// Replace the position cache with a new projection. The version bumps
-/// monotonically so old rows that didn't make it into this projection
-/// remain identifiable as stale (though we just delete them outright here).
-#[tauri::command]
-fn save_belief_positions(
-    state: State<'_, AppState>,
-    positions: Vec<PositionUpdate>,
-) -> Result<i64, String> {
-    state
-        .db
-        .with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let next_version: i64 = tx
-                .query_row(
-                    "SELECT COALESCE(MAX(projection_version), 0) + 1 FROM belief_positions",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(1);
-            // Wipe existing positions; we do full re-projections, not partial.
-            tx.execute("DELETE FROM belief_positions", [])?;
-            let now = chrono::Utc::now().to_rfc3339();
-            for p in &positions {
-                tx.execute(
-                    "INSERT INTO belief_positions
-                       (belief_id, x, y, projection_version, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![p.belief_id, p.x, p.y, next_version, now],
-                )?;
-            }
-            tx.commit()?;
-            Ok(next_version)
-        })
-        .map_err(|e| e.to_string())
-}
-
-// ---------- merge candidates ----------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MergeCandidate {
-    pub a_id: String,
-    pub a_statement: String,
-    pub a_status: String,
-    pub a_trust_class: String,
-    pub a_confidence: f64,
-    pub b_id: String,
-    pub b_statement: String,
-    pub b_status: String,
-    pub b_trust_class: String,
-    pub b_confidence: f64,
-    pub cosine: f64,
-    /// "definite" (>= dedup_cosine_threshold) or "likely" (>= suggest threshold).
-    pub tier: String,
-}
-
-/// Sweep all embedded beliefs (excluding blocked/expired) and surface pairs
-/// whose cosine similarity is at or above the suggest threshold. The dedup
-/// auto-merge threshold marks one tier; pairs below that are surfaced as
-/// "review me" candidates. O(N) MATCH queries; fine for personal corpora.
-#[tauri::command]
-fn list_merge_candidates(state: State<'_, AppState>) -> Result<Vec<MergeCandidate>, String> {
-    let dedup_threshold: f64 = state
-        .db
-        .get_setting("dedup_cosine_threshold")
-        .map_err(|e| e.to_string())?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(embeddings::DEFAULT_DEDUP_COSINE_THRESHOLD);
-    let suggest_threshold: f64 = state
-        .db
-        .get_setting("dedup_suggest_threshold")
-        .map_err(|e| e.to_string())?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(embeddings::DEFAULT_SUGGEST_COSINE_THRESHOLD);
-
-    state
-        .db
-        .with_conn(|conn| {
-            // First: ids of every belief that has an embedding AND is in
-            // active status (excludes blocked/expired/corrected). Corrected
-            // beliefs were previously merged or marked wrong; don't resurface.
-            let mut id_stmt = conn.prepare(
-                "SELECT v.belief_id
-                 FROM vec_beliefs v
-                 JOIN beliefs b ON b.id = v.belief_id
-                 WHERE b.status NOT IN ('blocked','expired','corrected')",
-            )?;
-            let ids: Vec<String> = id_stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // For each belief, fetch its embedding blob and find its top-5
-            // nearest neighbors. Dedup pairs (a, b) by ordering id strings.
-            let mut emb_stmt = conn.prepare(
-                "SELECT embedding FROM vec_beliefs WHERE belief_id = ?1",
-            )?;
-            let mut nn_stmt = conn.prepare(
-                "SELECT v.belief_id, v.distance, bv.statement, b.status, b.trust_class, bv.confidence
-                 FROM (
-                     SELECT belief_id, distance
-                     FROM vec_beliefs
-                     WHERE embedding MATCH ?1 AND k = 6
-                     ORDER BY distance
-                 ) v
-                 JOIN beliefs b ON b.id = v.belief_id
-                 JOIN belief_versions bv ON bv.id = b.current_version_id
-                 WHERE b.status NOT IN ('blocked','expired','corrected')",
-            )?;
-
-            // Cache the (statement, status, trust_class, confidence) for each id we touch.
-            type Meta = (String, String, String, f64);
-            let mut meta: std::collections::HashMap<String, Meta> = std::collections::HashMap::new();
-            let mut load_meta = |id: &str| -> rusqlite::Result<Option<Meta>> {
-                if let Some(m) = meta.get(id) {
-                    return Ok(Some(m.clone()));
-                }
-                let r: Option<Meta> = conn
-                    .query_row(
-                        "SELECT bv.statement, b.status, b.trust_class, bv.confidence
-                         FROM beliefs b JOIN belief_versions bv ON bv.id = b.current_version_id
-                         WHERE b.id = ?1",
-                        params![id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .optional()?;
-                if let Some(ref m) = r {
-                    meta.insert(id.to_string(), m.clone());
-                }
-                Ok(r)
-            };
-
-            let mut seen_pairs: std::collections::HashSet<(String, String)> =
-                std::collections::HashSet::new();
-            let mut out: Vec<MergeCandidate> = Vec::new();
-
-            for id_a in &ids {
-                let blob: Vec<u8> = match emb_stmt.query_row(params![id_a], |r| r.get(0)) {
-                    Ok(b) => b,
-                    Err(_) => continue, // no embedding for this id (shouldn't happen)
-                };
-                let mut rows = nn_stmt.query(params![blob])?;
-                while let Some(row) = rows.next()? {
-                    let id_b: String = row.get(0)?;
-                    if id_b == *id_a {
-                        continue;
-                    }
-                    let dist: f64 = row.get(1)?;
-                    let cosine = embeddings::cosine_from_l2(dist);
-                    if cosine < suggest_threshold {
-                        continue;
-                    }
-                    let pair_key = if id_a < &id_b {
-                        (id_a.clone(), id_b.clone())
-                    } else {
-                        (id_b.clone(), id_a.clone())
-                    };
-                    if !seen_pairs.insert(pair_key.clone()) {
-                        continue;
-                    }
-
-                    let a_meta = match load_meta(id_a)? {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    let b_meta = match load_meta(&id_b)? {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    out.push(MergeCandidate {
-                        a_id: id_a.clone(),
-                        a_statement: a_meta.0,
-                        a_status: a_meta.1,
-                        a_trust_class: a_meta.2,
-                        a_confidence: a_meta.3,
-                        b_id: id_b,
-                        b_statement: b_meta.0,
-                        b_status: b_meta.1,
-                        b_trust_class: b_meta.2,
-                        b_confidence: b_meta.3,
-                        cosine,
-                        tier: if cosine >= dedup_threshold {
-                            "definite".to_string()
-                        } else {
-                            "likely".to_string()
-                        },
-                    });
-                }
-            }
-
-            out.sort_by(|a, b| {
-                b.cosine
-                    .partial_cmp(&a.cosine)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            Ok(out)
-        })
-        .map_err(|e| e.to_string())
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MergeBeliefsArgs {
-    /// Belief that survives the merge.
-    pub keeper_id: String,
-    /// Belief that gets absorbed (marked corrected, embedding removed).
-    pub absorbed_id: String,
-    pub reason: Option<String>,
-}
-
-/// Absorb `absorbed_id` into `keeper_id`. Mechanics:
-/// 1. Copy every provenance edge on absorbed's current version to keeper's
-///    current version (so keeper inherits all the source citations).
-/// 2. Write a new version of absorbed with status='corrected', editor='user',
-///    reason "merged into <keeper_id>: <user reason>".
-/// 3. Add a `corrected_by` provenance edge from absorbed's new version to
-///    the keeper belief.
-/// 4. Delete absorbed's row from vec_beliefs so it stops surfacing in
-///    retrieval and merge-candidate sweeps.
-#[tauri::command]
-fn merge_beliefs(state: State<'_, AppState>, args: MergeBeliefsArgs) -> Result<(), String> {
-    if args.keeper_id == args.absorbed_id {
-        return Err("cannot merge a belief into itself".into());
-    }
-    state
-        .db
-        .with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-
-            let keeper_version_id: String = tx.query_row(
-                "SELECT current_version_id FROM beliefs WHERE id = ?1",
-                params![args.keeper_id],
-                |r| r.get(0),
-            )?;
-            let absorbed_version_id: String = tx.query_row(
-                "SELECT current_version_id FROM beliefs WHERE id = ?1",
-                params![args.absorbed_id],
-                |r| r.get(0),
-            )?;
-
-            // 1. Copy provenance edges from absorbed → keeper. Skip
-            // self-references and any duplicate (same source_type+source_id+relation).
-            let mut select_prov = tx.prepare(
-                "SELECT source_type, source_id, relation
-                 FROM belief_provenance WHERE belief_version_id = ?1",
-            )?;
-            let edges: Vec<(String, String, String)> = select_prov
-                .query_map(params![absorbed_version_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(select_prov);
-
-            for (source_type, source_id, relation) in edges {
-                let already: Option<i64> = tx
-                    .query_row(
-                        "SELECT 1 FROM belief_provenance
-                         WHERE belief_version_id = ?1
-                           AND source_type = ?2
-                           AND source_id = ?3
-                           AND relation = ?4
-                         LIMIT 1",
-                        params![keeper_version_id, source_type, source_id, relation],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if already.is_some() {
-                    continue;
-                }
-                tx.execute(
-                    "INSERT INTO belief_provenance
-                       (id, belief_version_id, source_type, source_id, relation, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        uuid::Uuid::new_v4().to_string(),
-                        keeper_version_id,
-                        source_type,
-                        source_id,
-                        relation,
-                        chrono::Utc::now().to_rfc3339(),
-                    ],
-                )?;
-            }
-
-            // 2. New version of absorbed: status=corrected, marks the merge.
-            let user_reason = args.reason.as_deref().unwrap_or("");
-            let merge_reason = if user_reason.is_empty() {
-                format!("merged into {}", args.keeper_id)
-            } else {
-                format!("merged into {}: {}", args.keeper_id, user_reason)
-            };
-            let ledger = Ledger::new(&tx);
-            let absorbed_keeper_statement: String = tx.query_row(
-                "SELECT bv.statement FROM beliefs b
-                 JOIN belief_versions bv ON bv.id = b.current_version_id
-                 WHERE b.id = ?1",
-                params![args.absorbed_id],
-                |r| r.get(0),
-            )?;
-            let absorbed_confidence: f64 = tx.query_row(
-                "SELECT bv.confidence FROM beliefs b
-                 JOIN belief_versions bv ON bv.id = b.current_version_id
-                 WHERE b.id = ?1",
-                params![args.absorbed_id],
-                |r| r.get(0),
-            )?;
-            let new_absorbed_version = ledger.add_version(
-                &args.absorbed_id,
-                NewVersion {
-                    statement: absorbed_keeper_statement,
-                    confidence: absorbed_confidence,
-                    reason: Some(merge_reason),
-                    editor: Editor::User,
-                },
-                Some(Status::Corrected),
-            )?;
-
-            // 3. corrected_by edge from absorbed's new version → keeper belief.
-            ledger.add_provenance(
-                &new_absorbed_version.id,
-                NewProvenance {
-                    source_type: SourceType::Belief,
-                    source_id: args.keeper_id.clone(),
-                    relation: ProvenanceRelation::CorrectedBy,
-                },
-            )?;
-
-            // 4. Drop absorbed from the vector index.
-            tx.execute(
-                "DELETE FROM vec_beliefs WHERE belief_id = ?1",
-                params![args.absorbed_id],
-            )?;
-
-            tx.commit()?;
-            Ok(())
-        })
-        .map_err(|e| e.to_string())
-}
 
 // ---------- summarization ----------
 
@@ -2476,6 +1286,38 @@ pub(crate) async fn run_summarize_pass(
                     continue;
                 }
 
+                // A summary's confidence is the mean of its children's
+                // structural scores — computed in Rust, never an LLM rating.
+                let mut score_sum = 0.0f64;
+                let mut scored = 0u32;
+                for child_id in &valid_children {
+                    if let Ok((tc, rc, created, last_reinf)) = tx.query_row(
+                        "SELECT b.trust_class,
+                                (SELECT COUNT(*) FROM belief_provenance bp
+                                 JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
+                                 WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by'),
+                                b.created_at, b.last_reinforced_at
+                         FROM beliefs b WHERE b.id = ?1",
+                        params![child_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    ) {
+                        score_sum += effective_conf(&tc, rc, &created, last_reinf.as_deref(), None).score;
+                        scored += 1;
+                    }
+                }
+                let agg_confidence = if scored > 0 {
+                    Some(score_sum / scored as f64)
+                } else {
+                    None
+                };
+
                 let (summary, summary_v) = ledger.insert_belief(NewBelief {
                     subject: "user".into(),
                     category: Some(category_for_log.clone()),
@@ -2487,7 +1329,7 @@ pub(crate) async fn run_summarize_pass(
                     parent_summary_id: None,
                     initial_version: NewVersion {
                         statement: s.statement.clone(),
-                        confidence: s.confidence,
+                        confidence: agg_confidence,
                         reason: Some(format!("cluster of {}", valid_children.len())),
                         editor: Editor::Ai,
                     },
@@ -2691,18 +1533,16 @@ async fn mcp_accept_proposal(
     proposal_id: String,
     statement: Option<String>,
     category: Option<String>,
-    confidence: Option<f64>,
     trust_class: Option<String>,
 ) -> Result<String, String> {
     let tc = match trust_class.as_deref() {
         None => None,
         Some(s) => Some(ledger::TrustClass::from_str(s).map_err(|e| e.to_string())?),
     };
-    let override_ = if statement.is_some() || category.is_some() || confidence.is_some() || tc.is_some() {
+    let override_ = if statement.is_some() || category.is_some() || tc.is_some() {
         Some(mcp::proposals::AcceptOverride {
             statement,
             category,
-            confidence,
             trust_class: tc,
         })
     } else {
@@ -2981,6 +1821,11 @@ pub fn run() {
             name_cluster,
             list_merge_candidates,
             merge_beliefs,
+            dismiss_merge_candidate,
+            auto_merge_duplicates,
+            merge_all_candidates,
+            recent_merges,
+            undo_merge,
             get_graph_snapshot,
             get_graph_edges_extended,
             get_turns_for_belief,
@@ -2999,4 +1844,178 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn fresh_conn() -> Connection {
+        // register_vec_extension MUST run before open_in_memory — sqlite-vec
+        // loads via sqlite3_auto_extension, which only fires on new connections.
+        crate::embeddings::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        conn
+    }
+
+    fn insert_leaf(conn: &Connection, statement: &str) -> (String, String) {
+        let ledger = Ledger::new(conn);
+        let (b, v) = ledger
+            .insert_belief(NewBelief {
+                subject: "user".into(),
+                category: Some("preference".into()),
+                status: Status::Inferred,
+                trust_class: TrustClass::Inferred,
+                scope: Scope::Global,
+                scope_ref_id: None,
+                level: 0,
+                parent_summary_id: None,
+                initial_version: NewVersion {
+                    statement: statement.into(),
+                    confidence: None,
+                    reason: None,
+                    editor: Editor::Ai,
+                },
+            })
+            .unwrap();
+        (b.id, v.id)
+    }
+
+    fn embed(conn: &Connection, belief_id: &str) {
+        let blob = embeddings::vec_to_blob(&vec![0.1f32; embeddings::EMBEDDING_DIM]).unwrap();
+        conn.execute(
+            "INSERT INTO vec_beliefs (belief_id, embedding) VALUES (?1, ?2)",
+            params![belief_id, blob],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_then_undo_restores_absorbed_belief() {
+        let conn = fresh_conn();
+        let (a_id, a_ver) = insert_leaf(&conn, "Likes tea");
+        let (b_id, b_ver) = insert_leaf(&conn, "Enjoys tea");
+        embed(&conn, &a_id);
+        embed(&conn, &b_id);
+
+        // Give the soon-to-be-absorbed belief a provenance edge the keeper
+        // should inherit (and lose again on undo).
+        Ledger::new(&conn)
+            .add_provenance(
+                &b_ver,
+                NewProvenance {
+                    source_type: SourceType::Turn,
+                    source_id: "turn-1".into(),
+                    relation: ProvenanceRelation::ExtractedFrom,
+                },
+            )
+            .unwrap();
+
+        let status_of = |id: &str| -> String {
+            conn.query_row("SELECT status FROM beliefs WHERE id=?1", params![id], |r| r.get(0))
+                .unwrap()
+        };
+        let cur_ver = |id: &str| -> String {
+            conn.query_row("SELECT current_version_id FROM beliefs WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let in_vec = |id: &str| -> bool {
+            conn.query_row("SELECT COUNT(*) FROM vec_beliefs WHERE belief_id=?1", params![id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                > 0
+        };
+        let ver_count = |id: &str| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM belief_versions WHERE belief_id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let a_edges = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM belief_provenance WHERE belief_version_id=?1",
+                params![a_ver],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let b_prior_status = status_of(&b_id);
+        let b_prior_ver = cur_ver(&b_id);
+        let b_prior_vercount = ver_count(&b_id);
+        let a_edges_before = a_edges();
+
+        // Merge B into A.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            merge_in_tx(&tx, &a_id, &b_id, Some("dup"), "manual", Some(0.95)).unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(status_of(&b_id), "corrected", "absorbed belief is tombstoned");
+        assert!(!in_vec(&b_id), "absorbed belief leaves the vector index");
+        assert!(in_vec(&a_id), "keeper stays indexed");
+        assert_eq!(a_edges(), a_edges_before + 1, "keeper inherits the provenance edge");
+        assert_eq!(ver_count(&b_id), b_prior_vercount + 1, "tombstone version was written");
+
+        let merge_id: String = conn
+            .query_row("SELECT id FROM belief_merges WHERE absorbed_id=?1", params![b_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // Undo.
+        undo_merge_in_conn(&conn, &merge_id).unwrap();
+
+        assert_eq!(status_of(&b_id), b_prior_status, "status restored");
+        assert_eq!(cur_ver(&b_id), b_prior_ver, "current version restored");
+        assert_eq!(ver_count(&b_id), b_prior_vercount, "tombstone version removed");
+        assert!(in_vec(&b_id), "absorbed belief re-indexed");
+        assert_eq!(a_edges(), a_edges_before, "copied edge removed from keeper");
+
+        let reverted: Option<String> = conn
+            .query_row("SELECT reverted_at FROM belief_merges WHERE id=?1", params![merge_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(reverted.is_some(), "merge marked reverted");
+
+        // Undo is idempotent — a second call is a no-op.
+        undo_merge_in_conn(&conn, &merge_id).unwrap();
+    }
+
+    #[test]
+    fn pick_keeper_prefers_more_grounded_trust_class() {
+        let conn = fresh_conn();
+        // A is inferred, B asserted → B should be kept.
+        let (a_id, _) = insert_leaf(&conn, "Probably likes tea");
+        let ledger = Ledger::new(&conn);
+        let (b, _) = ledger
+            .insert_belief(NewBelief {
+                subject: "user".into(),
+                category: Some("preference".into()),
+                status: Status::Asserted,
+                trust_class: TrustClass::Asserted,
+                scope: Scope::Global,
+                scope_ref_id: None,
+                level: 0,
+                parent_summary_id: None,
+                initial_version: NewVersion {
+                    statement: "Likes tea".into(),
+                    confidence: None,
+                    reason: None,
+                    editor: Editor::User,
+                },
+            })
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let (keeper, absorbed) = pick_keeper(&tx, &a_id, &b.id).unwrap();
+        assert_eq!(keeper, b.id, "asserted belief survives");
+        assert_eq!(absorbed, a_id);
+    }
 }

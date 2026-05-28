@@ -19,7 +19,6 @@ pub const SUMMARIZATION_TEMPLATE: &str = concat!(
     "statements that capture the gist without losing nuance.\n\n",
     "For each summary output:\n",
     "- statement: a short third-person summary (under 25 words)\n",
-    "- confidence: 0.0 to 1.0, the average confidence of the children it covers\n",
     "- child_ids: list of belief ids from the input that this summary covers\n\n",
     "HARD RULES (violating these makes the output worthless):\n",
     "1. NO OVERLAP. Each input belief id appears in AT MOST ONE summary's\n",
@@ -59,7 +58,9 @@ pub struct SummarizationContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SummaryDraft {
     pub statement: String,
-    pub confidence: f64,
+    // No confidence: a summary's confidence is computed in Rust as the
+    // aggregate of its children's structural scores (see confidence.rs),
+    // not invented by the model.
     pub child_ids: Vec<String>,
 }
 
@@ -98,9 +99,6 @@ pub fn parse_response(raw: &str) -> Result<Vec<SummaryDraft>> {
         .with_context(|| format!("summarization response was not valid JSON: {:?}", cleaned))?;
 
     for s in &parsed.summaries {
-        if s.confidence < 0.0 || s.confidence > 1.0 {
-            return Err(anyhow!("summary confidence out of range: {}", s.confidence));
-        }
         if s.statement.trim().is_empty() {
             return Err(anyhow!("empty summary statement"));
         }
@@ -165,12 +163,6 @@ mod tests {
     #[test]
     fn parse_rejects_no_children() {
         let raw = r#"{"summaries":[{"statement":"x","confidence":0.5,"child_ids":[]}]}"#;
-        assert!(parse_response(raw).is_err());
-    }
-
-    #[test]
-    fn parse_rejects_bad_confidence() {
-        let raw = r#"{"summaries":[{"statement":"x","confidence":1.5,"child_ids":["a"]}]}"#;
         assert!(parse_response(raw).is_err());
     }
 

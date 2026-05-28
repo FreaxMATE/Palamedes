@@ -18,7 +18,9 @@ pub struct ConversationActivity {
 pub struct BeliefRow {
     pub statement: String,
     pub category: Option<String>,
-    pub confidence: f64,
+    /// Coarse structural-confidence bucket: "strong" | "moderate" | "tentative".
+    /// (Confidence is never a self-reported number — see confidence.rs.)
+    pub confidence_bucket: String,
     pub status: String,
     pub trust_class: String,
 }
@@ -87,9 +89,9 @@ pub fn render_markdown(d: &RecapData) -> String {
         ));
         for b in &inferred {
             out.push_str(&format!(
-                "- {} `{:.2}` · _{}_ — {}\n",
+                "- {} `{}` · _{}_ — {}\n",
                 trust_badge(&b.trust_class),
-                b.confidence,
+                b.confidence_bucket,
                 b.category.as_deref().unwrap_or("other"),
                 b.statement
             ));
@@ -101,9 +103,9 @@ pub fn render_markdown(d: &RecapData) -> String {
         out.push_str(&format!("### Other belief activity ({})\n\n", other.len()));
         for b in &other {
             out.push_str(&format!(
-                "- {} `{:.2}` · {} · _{}_ — {}\n",
+                "- {} `{}` · {} · _{}_ — {}\n",
                 trust_badge(&b.trust_class),
-                b.confidence,
+                b.confidence_bucket,
                 b.status,
                 b.category.as_deref().unwrap_or("other"),
                 b.statement
@@ -159,14 +161,14 @@ mod tests {
                 BeliefRow {
                     statement: "Prefers terse summaries".into(),
                     category: Some("preference".into()),
-                    confidence: 0.8,
+                    confidence_bucket: "moderate".into(),
                     status: "inferred".into(),
                     trust_class: "inferred".into(),
                 },
                 BeliefRow {
                     statement: "Builds Palamedes in Rust + Tauri".into(),
                     category: Some("skill".into()),
-                    confidence: 1.0,
+                    confidence_bucket: "strong".into(),
                     status: "asserted".into(),
                     trust_class: "asserted".into(),
                 },

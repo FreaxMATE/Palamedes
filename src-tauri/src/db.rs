@@ -86,6 +86,7 @@ impl Db {
             }
         }
         migrate_provenance_check_constraint(&conn)?;
+        migrate_belief_versions_confidence_nullable(&conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["system_prompt", DEFAULT_SYSTEM_PROMPT],
@@ -706,6 +707,9 @@ pub struct RetrievedBelief {
 pub struct DedupCandidate {
     pub belief_id: String,
     pub version_id: String,
+    /// Currently unused at consumer sites — kept on the row so future debug /
+    /// inspection paths have the human-readable claim without re-querying.
+    #[allow(dead_code)]
     pub statement: String,
     pub status: String,
     pub distance: f64,
@@ -757,6 +761,64 @@ fn migrate_provenance_check_constraint(conn: &Connection) -> Result<bool> {
         COMMIT;
         "#,
     )?;
+    Ok(true)
+}
+
+/// Drop the `NOT NULL` constraint on `belief_versions.confidence` for existing
+/// DBs. Confidence is no longer stored for leaf beliefs (it is derived
+/// structurally at read time — see `confidence.rs`), so new versions insert
+/// NULL. SQLite can't ALTER a column's nullability in place, so we rebuild the
+/// table with the rename-table dance.
+///
+/// `belief_versions` is FK-referenced by `belief_provenance` (ON DELETE CASCADE)
+/// and `recall_receipts`, so we MUST disable foreign keys for the rebuild —
+/// otherwise dropping the table would cascade-delete every provenance row and
+/// violate the receipts FK. `PRAGMA foreign_keys` is a no-op inside a
+/// transaction, so it is toggled outside the BEGIN/COMMIT.
+fn migrate_belief_versions_confidence_nullable(conn: &Connection) -> Result<bool> {
+    let existing_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='belief_versions'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(sql) = existing_sql else {
+        return Ok(false); // fresh DB: schema.sql already wrote the nullable column
+    };
+    if sql.contains("confidence IS NULL") {
+        return Ok(false); // already migrated
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let rebuild = conn.execute_batch(
+        r#"
+        BEGIN;
+        CREATE TABLE belief_versions_new (
+            id          TEXT PRIMARY KEY,
+            belief_id   TEXT NOT NULL REFERENCES beliefs(id) ON DELETE CASCADE,
+            version_num INTEGER NOT NULL,
+            statement   TEXT    NOT NULL,
+            confidence  REAL    CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+            reason      TEXT,
+            editor      TEXT    NOT NULL CHECK (editor IN ('user','ai','system')),
+            created_at  TEXT    NOT NULL,
+            UNIQUE (belief_id, version_num)
+        );
+        INSERT INTO belief_versions_new
+            (id, belief_id, version_num, statement, confidence, reason, editor, created_at)
+        SELECT id, belief_id, version_num, statement, confidence, reason, editor, created_at
+        FROM belief_versions;
+        DROP TABLE belief_versions;
+        ALTER TABLE belief_versions_new RENAME TO belief_versions;
+        CREATE INDEX IF NOT EXISTS idx_belief_versions_belief ON belief_versions(belief_id);
+        COMMIT;
+        "#,
+    );
+    // Restore foreign-key enforcement regardless of whether the rebuild
+    // succeeded, then surface any error.
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    rebuild?;
     Ok(true)
 }
 
@@ -932,5 +994,100 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let ran = migrate_provenance_check_constraint(&conn).unwrap();
         assert!(!ran, "migration should no-op when table doesn't exist");
+    }
+
+    /// A pre-this-commit belief_versions with `confidence REAL NOT NULL`, plus
+    /// the FK-referencing belief_provenance with ON DELETE CASCADE — exactly the
+    /// shape that makes the rebuild dangerous if foreign keys aren't disabled.
+    const OLD_BELIEF_VERSIONS_SCHEMA: &str = r#"
+        CREATE TABLE beliefs (id TEXT PRIMARY KEY);
+        CREATE TABLE belief_versions (
+            id          TEXT PRIMARY KEY,
+            belief_id   TEXT NOT NULL REFERENCES beliefs(id) ON DELETE CASCADE,
+            version_num INTEGER NOT NULL,
+            statement   TEXT    NOT NULL,
+            confidence  REAL    NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+            reason      TEXT,
+            editor      TEXT    NOT NULL CHECK (editor IN ('user','ai','system')),
+            created_at  TEXT    NOT NULL,
+            UNIQUE (belief_id, version_num)
+        );
+        CREATE TABLE belief_provenance (
+            id                TEXT PRIMARY KEY,
+            belief_version_id TEXT NOT NULL REFERENCES belief_versions(id) ON DELETE CASCADE,
+            source_type       TEXT NOT NULL,
+            source_id         TEXT NOT NULL,
+            relation          TEXT NOT NULL,
+            created_at        TEXT NOT NULL
+        );
+    "#;
+
+    #[test]
+    fn confidence_migration_makes_column_nullable_without_nuking_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Foreign keys ON — this is what makes the naive DROP dangerous.
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(OLD_BELIEF_VERSIONS_SCHEMA).unwrap();
+
+        conn.execute("INSERT INTO beliefs (id) VALUES ('b1')", []).unwrap();
+        conn.execute(
+            "INSERT INTO belief_versions
+               (id, belief_id, version_num, statement, confidence, reason, editor, created_at)
+             VALUES ('v1','b1',1,'stmt',0.9,'why','ai','2026-05-26T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO belief_provenance
+               (id, belief_version_id, source_type, source_id, relation, created_at)
+             VALUES ('p1','v1','turn','m1','extracted_from','2026-05-26T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-migration: NULL confidence is rejected by the NOT NULL constraint.
+        let pre = conn.execute(
+            "INSERT INTO belief_versions
+               (id, belief_id, version_num, statement, confidence, reason, editor, created_at)
+             VALUES ('v2','b1',2,'stmt2',NULL,NULL,'ai','2026-05-26T00:00:00Z')",
+            [],
+        );
+        assert!(pre.is_err(), "old NOT NULL should reject a NULL confidence");
+
+        let ran = migrate_belief_versions_confidence_nullable(&conn).unwrap();
+        assert!(ran, "migration should run on the legacy schema");
+
+        // The provenance row survived — foreign keys were OFF during the drop,
+        // so ON DELETE CASCADE did NOT fire.
+        let prov: i64 = conn
+            .query_row("SELECT COUNT(*) FROM belief_provenance", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(prov, 1, "provenance must survive the rebuild");
+        let bv: i64 = conn
+            .query_row("SELECT COUNT(*) FROM belief_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bv, 1, "existing version rows must be preserved");
+
+        // Post-migration: NULL confidence is now accepted.
+        conn.execute(
+            "INSERT INTO belief_versions
+               (id, belief_id, version_num, statement, confidence, reason, editor, created_at)
+             VALUES ('v2','b1',2,'stmt2',NULL,NULL,'ai','2026-05-26T00:00:00Z')",
+            [],
+        )
+        .expect("NULL confidence should now be allowed");
+
+        // Idempotent.
+        let again = migrate_belief_versions_confidence_nullable(&conn).unwrap();
+        assert!(!again, "migration should no-op once already applied");
+    }
+
+    #[test]
+    fn confidence_migration_noops_on_fresh_schema() {
+        crate::embeddings::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let ran = migrate_belief_versions_confidence_nullable(&conn).unwrap();
+        assert!(!ran, "fresh schema is already nullable");
     }
 }

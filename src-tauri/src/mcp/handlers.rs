@@ -44,6 +44,9 @@ pub struct PalamedesMcpHandler {
     /// the write tools to attribute proposals to the right `mcp_clients`
     /// row. Per-session, so each MCP client gets its own handler.
     pub client_id: Arc<RwLock<Option<String>>>,
+    // Populated by the `#[tool_router]` macro and consumed reflectively
+    // by `rmcp`'s ServerHandler impl — never read directly from Rust.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -70,8 +73,6 @@ pub struct ListBeliefsInput {
     pub status: Option<String>,
     /// Filter by category, e.g. preference / fact / skill / plan / context.
     pub category: Option<String>,
-    /// Drop beliefs whose current_version.confidence < this value.
-    pub min_confidence: Option<f64>,
     /// Max rows to return. Capped at 500 server-side.
     pub limit: Option<i64>,
 }
@@ -102,8 +103,9 @@ pub struct ProposeBeliefInput {
     pub source: String,
     /// Suggested category. The user can override on accept.
     pub category: Option<String>,
-    /// Your confidence in [0, 1]. The user can override on accept.
-    pub confidence: Option<f64>,
+    // No confidence field: Palamedes does not accept self-reported confidence
+    // from any source (model or external AI). Confidence is derived
+    // structurally from reinforcement + recency once the belief is accepted.
     /// Optional explanation of why you're proposing this. Shown in
     /// the audit inbox.
     pub reasoning: Option<String>,
@@ -276,7 +278,6 @@ impl PalamedesMcpHandler {
                         statement: input.statement,
                         source: input.source,
                         category: input.category,
-                        confidence: input.confidence,
                         reasoning: input.reasoning,
                     },
                 )
@@ -486,7 +487,10 @@ fn list_beliefs_sql(
         "SELECT b.id, b.subject, b.category, b.current_version_id, b.status, b.trust_class,
                 b.scope, b.scope_ref_id, b.level, b.parent_summary_id,
                 b.created_at, b.updated_at, b.last_reinforced_at,
-                bv.statement, bv.confidence
+                bv.statement, bv.confidence,
+                (SELECT COUNT(*) FROM belief_provenance bp
+                  JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
+                  WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count
          FROM beliefs b
          LEFT JOIN belief_versions bv ON bv.id = b.current_version_id
          WHERE 1=1",
@@ -504,32 +508,43 @@ fn list_beliefs_sql(
         sql.push_str(" AND b.category = ?");
         binds.push(Box::new(cat.to_string()));
     }
-    if let Some(min_c) = input.min_confidence {
-        sql.push_str(" AND COALESCE(bv.confidence, 0) >= ?");
-        binds.push(Box::new(min_c));
-    }
     sql.push_str(" ORDER BY b.updated_at DESC LIMIT ?");
     binds.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |r| {
+        let trust_class: String = r.get(5)?;
+        let created_at: String = r.get(10)?;
+        let last_reinforced_at: Option<String> = r.get(12)?;
+        let stored: Option<f64> = r.get(14)?;
+        let reinforced_count: i64 = r.get(15)?;
+        // Structural confidence — never self-reported. See confidence.rs.
+        let eff = crate::confidence::effective_for(
+            &trust_class,
+            reinforced_count,
+            &created_at,
+            last_reinforced_at.as_deref(),
+            stored,
+        );
         Ok(json!({
             "id": r.get::<_, String>(0)?,
             "subject": r.get::<_, String>(1)?,
             "category": r.get::<_, Option<String>>(2)?,
             "current_version_id": r.get::<_, Option<String>>(3)?,
             "status": r.get::<_, String>(4)?,
-            "trust_class": r.get::<_, String>(5)?,
+            "trust_class": trust_class,
             "scope": r.get::<_, String>(6)?,
             "scope_ref_id": r.get::<_, Option<String>>(7)?,
             "level": r.get::<_, i32>(8)?,
             "parent_summary_id": r.get::<_, Option<String>>(9)?,
-            "created_at": r.get::<_, String>(10)?,
+            "created_at": created_at,
             "updated_at": r.get::<_, String>(11)?,
-            "last_reinforced_at": r.get::<_, Option<String>>(12)?,
+            "last_reinforced_at": last_reinforced_at,
+            "reinforced_count": reinforced_count,
             "statement": r.get::<_, Option<String>>(13)?,
-            "confidence": r.get::<_, Option<f64>>(14)?,
+            "confidence": eff.score,
+            "confidence_bucket": eff.bucket.as_str(),
         }))
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)

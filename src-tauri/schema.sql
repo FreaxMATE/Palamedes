@@ -102,7 +102,11 @@ CREATE TABLE IF NOT EXISTS belief_versions (
     belief_id   TEXT NOT NULL REFERENCES beliefs(id) ON DELETE CASCADE,
     version_num INTEGER NOT NULL,
     statement   TEXT    NOT NULL,
-    confidence  REAL    NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    -- Confidence is NOT self-reported by the model. It is derived structurally
+    -- at read time (see src/confidence.rs) from trust class + reinforcement +
+    -- recency, so leaf versions store NULL here. Summaries store a Rust-computed
+    -- aggregate of their children's structural scores. Nullable on purpose.
+    confidence  REAL    CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
     reason      TEXT,                                     -- why this version exists
     editor      TEXT    NOT NULL CHECK (editor IN ('user','ai','system')),
     created_at  TEXT    NOT NULL,
@@ -150,6 +154,49 @@ CREATE TABLE IF NOT EXISTS belief_blocklist (
     reason     TEXT,
     created_at TEXT NOT NULL,
     CHECK (pattern IS NOT NULL OR belief_id IS NOT NULL)
+);
+
+-- ============================================================================
+-- Merge log: one row per belief merge (auto or manual) so the audit panel can
+-- show a "recently merged" digest and offer a one-click Undo. Each row captures
+-- enough to fully reverse the merge: the absorbed belief's prior status +
+-- version, the tombstone version the merge wrote, the provenance edges copied
+-- into the keeper, and the absorbed embedding (so retrieval can be restored).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS belief_merges (
+    id                        TEXT PRIMARY KEY,
+    keeper_id                 TEXT NOT NULL,
+    keeper_statement          TEXT NOT NULL,
+    absorbed_id               TEXT NOT NULL,
+    absorbed_statement        TEXT NOT NULL,
+    absorbed_prior_status     TEXT NOT NULL,
+    absorbed_prior_version_id TEXT NOT NULL,
+    tombstone_version_id      TEXT NOT NULL,
+    copied_prov_ids           TEXT NOT NULL DEFAULT '[]', -- JSON array of belief_provenance.id copied into keeper
+    absorbed_embedding        BLOB,                        -- absorbed's vec row, to restore on undo (NULL if none)
+    cosine                    REAL,
+    kind                      TEXT NOT NULL CHECK (kind IN ('auto','manual')),
+    created_at                TEXT NOT NULL,
+    reverted_at               TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_belief_merges_created ON belief_merges(created_at);
+
+-- ============================================================================
+-- Merge dismissals: pairs the user reviewed and declared NOT duplicates
+-- ("keep separated"). Excluded from every future merge-candidate sweep so the
+-- same pair stops resurfacing — and so the auto-merge sweep never collapses
+-- them either. Stored ordered (belief_a_id < belief_b_id) so the lookup key is
+-- stable regardless of which side was A or B in a given scan. CASCADE so a
+-- dismissal vanishes if either belief is later deleted.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS belief_merge_dismissals (
+    belief_a_id TEXT NOT NULL REFERENCES beliefs(id) ON DELETE CASCADE,
+    belief_b_id TEXT NOT NULL REFERENCES beliefs(id) ON DELETE CASCADE,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (belief_a_id, belief_b_id)
 );
 
 -- ============================================================================

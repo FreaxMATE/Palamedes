@@ -41,6 +41,7 @@ pub enum ProposalStatus {
 }
 
 impl ProposalKind {
+    #[allow(dead_code)] // Symmetric counterpart to `from_str`; kept for serialization parity.
     fn as_str(&self) -> &'static str {
         match self {
             Self::Propose => "propose",
@@ -110,7 +111,6 @@ pub struct ProposeInput {
     pub statement: String,
     pub source: String,
     pub category: Option<String>,
-    pub confidence: Option<f64>,
     pub reasoning: Option<String>,
 }
 
@@ -130,7 +130,7 @@ pub struct CorrectInput {
 pub struct AcceptOverride {
     pub statement: Option<String>,
     pub category: Option<String>,
-    pub confidence: Option<f64>,
+    // No confidence override: confidence is structural, never a stored number.
     pub trust_class: Option<TrustClass>,
 }
 
@@ -142,11 +142,6 @@ pub fn insert_propose(
     if input.statement.trim().is_empty() {
         return Err(anyhow!("propose_belief requires a non-empty statement"));
     }
-    if let Some(c) = input.confidence {
-        if !(0.0..=1.0).contains(&c) {
-            return Err(anyhow!("confidence must be in [0.0, 1.0], got {}", c));
-        }
-    }
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     conn.execute(
@@ -154,14 +149,13 @@ pub fn insert_propose(
            (id, client_id, kind, statement, suggested_category, suggested_confidence,
             reasoning, source, target_belief_id, suggested_status, correction_reason,
             status, decided_at, decided_belief_id, created_at)
-         VALUES (?1, ?2, 'propose', ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL,
-                 'pending', NULL, NULL, ?8)",
+         VALUES (?1, ?2, 'propose', ?3, ?4, NULL, ?5, ?6, NULL, NULL, NULL,
+                 'pending', NULL, NULL, ?7)",
         params![
             id,
             client_id,
             input.statement.trim(),
             input.category,
-            input.confidence,
             input.reasoning,
             input.source,
             now,
@@ -337,10 +331,6 @@ fn materialize_propose(
     let category = override_
         .and_then(|o| o.category.clone())
         .or_else(|| proposal.suggested_category.clone());
-    let confidence = override_
-        .and_then(|o| o.confidence)
-        .or(proposal.suggested_confidence)
-        .unwrap_or(0.6);
     let trust_class = override_
         .and_then(|o| o.trust_class)
         .unwrap_or(TrustClass::Inferred);
@@ -363,7 +353,8 @@ fn materialize_propose(
         parent_summary_id: None,
         initial_version: NewVersion {
             statement,
-            confidence,
+            // Leaf belief — confidence is structural, computed at read time.
+            confidence: None,
             reason: proposal
                 .reasoning
                 .clone()
@@ -517,7 +508,6 @@ mod tests {
                 statement: "User prefers Vim keybindings".into(),
                 source: "inferred from chat".into(),
                 category: Some("preference".into()),
-                confidence: Some(0.75),
                 reasoning: Some("Mentioned hjkl three times".into()),
             },
         )
@@ -526,13 +516,13 @@ mod tests {
         assert_eq!(p.status, ProposalStatus::Pending);
         assert_eq!(p.statement.as_deref(), Some("User prefers Vim keybindings"));
         assert_eq!(p.suggested_category.as_deref(), Some("preference"));
-        assert_eq!(p.suggested_confidence, Some(0.75));
+        assert_eq!(p.suggested_confidence, None);
         assert_eq!(p.reasoning.as_deref(), Some("Mentioned hjkl three times"));
         assert_eq!(p.source.as_deref(), Some("inferred from chat"));
     }
 
     #[test]
-    fn insert_propose_rejects_empty_statement_and_out_of_range_confidence() {
+    fn insert_propose_rejects_empty_statement() {
         let conn = fresh_conn();
         let cid = seed_client(&conn);
         assert!(insert_propose(
@@ -542,19 +532,6 @@ mod tests {
                 statement: "   ".into(),
                 source: "x".into(),
                 category: None,
-                confidence: None,
-                reasoning: None
-            }
-        )
-        .is_err());
-        assert!(insert_propose(
-            &conn,
-            &cid,
-            &ProposeInput {
-                statement: "ok".into(),
-                source: "x".into(),
-                category: None,
-                confidence: Some(1.5),
                 reasoning: None
             }
         )
@@ -591,7 +568,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "User likes spaces over tabs".into(),
-                    confidence: 0.6,
+                    confidence: None,
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -610,9 +587,7 @@ mod tests {
             &ProposeInput {
                 statement: "User uses Neovim daily".into(),
                 source: "claude-desktop".into(),
-                category: Some("preference".into()),
-                confidence: Some(0.8),
-                reasoning: None,
+                category: Some("preference".into()),                reasoning: None,
             },
         )
         .unwrap();
@@ -631,7 +606,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(v.statement, "User uses Neovim daily");
-        assert_eq!(v.confidence, 0.8);
+        // Leaf beliefs never store confidence — it's structural.
+        assert_eq!(v.confidence, None);
         assert_eq!(v.editor, Editor::Ai);
 
         // Two provenance edges: one for the proposal, one for the client.
@@ -652,9 +628,7 @@ mod tests {
             &ProposeInput {
                 statement: "User uses Neovim daily".into(),
                 source: "claude-desktop".into(),
-                category: Some("preference".into()),
-                confidence: Some(0.8),
-                reasoning: None,
+                category: Some("preference".into()),                reasoning: None,
             },
         )
         .unwrap();
@@ -664,7 +638,6 @@ mod tests {
             Some(AcceptOverride {
                 statement: Some("User uses Neovim, not vanilla Vim".into()),
                 category: Some("skill".into()),
-                confidence: Some(0.95),
                 trust_class: Some(TrustClass::Asserted),
             }),
         )
@@ -679,7 +652,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(v.statement, "User uses Neovim, not vanilla Vim");
-        assert_eq!(v.confidence, 0.95);
+        assert_eq!(v.confidence, None);
     }
 
     #[test]
@@ -727,7 +700,6 @@ mod tests {
                 statement: "Test".into(),
                 source: "x".into(),
                 category: None,
-                confidence: None,
                 reasoning: None,
             },
         )
@@ -749,7 +721,6 @@ mod tests {
                 statement: "A".into(),
                 source: "x".into(),
                 category: None,
-                confidence: None,
                 reasoning: None,
             },
         )
@@ -761,7 +732,6 @@ mod tests {
                 statement: "B".into(),
                 source: "x".into(),
                 category: None,
-                confidence: None,
                 reasoning: None,
             },
         )

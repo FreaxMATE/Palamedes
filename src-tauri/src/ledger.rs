@@ -137,7 +137,10 @@ pub struct BeliefVersion {
     pub belief_id: String,
     pub version_num: i32,
     pub statement: String,
-    pub confidence: f64,
+    /// NULL for leaf beliefs — confidence is derived structurally at read time
+    /// (see `confidence.rs`), never self-reported by the model. Summaries carry
+    /// a Rust-computed aggregate of their children's structural scores.
+    pub confidence: Option<f64>,
     pub reason: Option<String>,
     pub editor: Editor,
     pub created_at: String,
@@ -182,7 +185,9 @@ pub struct NewBelief {
 #[derive(Debug, Clone)]
 pub struct NewVersion {
     pub statement: String,
-    pub confidence: f64,
+    /// `None` for leaf beliefs (confidence is structural, not stored).
+    /// `Some(_)` only for summaries, whose aggregate is computed in Rust.
+    pub confidence: Option<f64>,
     pub reason: Option<String>,
     pub editor: Editor,
 }
@@ -402,6 +407,7 @@ impl<'a> Ledger<'a> {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[allow(dead_code)] // Public Ledger API; exercised by tests, kept for future consumers.
     pub fn list_beliefs(&self) -> Result<Vec<Belief>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, subject, category, current_version_id, status, trust_class,
@@ -413,6 +419,7 @@ impl<'a> Ledger<'a> {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[allow(dead_code)] // Public Ledger API; exercised by tests, kept for future consumers.
     pub fn children_of(&self, summary_id: &str) -> Result<Vec<Belief>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, subject, category, current_version_id, status, trust_class,
@@ -534,7 +541,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Uses Tauri + Svelte for Palamedes".into(),
-                    confidence: 1.0,
+                    confidence: Some(1.0),
                     reason: Some("user stated directly".into()),
                     editor: Editor::User,
                 },
@@ -566,7 +573,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Prefers transparent memory over black-box".into(),
-                    confidence: 0.8,
+                    confidence: Some(0.8),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -607,7 +614,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Is vegan".into(),
-                    confidence: 0.71,
+                    confidence: Some(0.71),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -619,7 +626,7 @@ mod tests {
                 &b.id,
                 NewVersion {
                     statement: "Is not vegan; was asking out of curiosity".into(),
-                    confidence: 1.0,
+                    confidence: Some(1.0),
                     reason: Some("user corrected".into()),
                     editor: Editor::User,
                 },
@@ -653,7 +660,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Prefers Rust for new services".into(),
-                    confidence: 0.8,
+                    confidence: Some(0.8),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -671,7 +678,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Prefers Zig for new services".into(),
-                    confidence: 0.7,
+                    confidence: Some(0.7),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -700,7 +707,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Is vegan".into(),
-                    confidence: 0.0,
+                    confidence: Some(0.0),
                     reason: Some("user corrected twice; hard-pinned wrong".into()),
                     editor: Editor::System,
                 },
@@ -737,7 +744,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Working on Palamedes in Rust".into(),
-                    confidence: 0.9,
+                    confidence: Some(0.9),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -755,7 +762,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Familiar with Tauri 2".into(),
-                    confidence: 0.85,
+                    confidence: Some(0.85),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -774,7 +781,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Building a Rust+Tauri personal AI tool".into(),
-                    confidence: 0.85,
+                    confidence: Some(0.85),
                     reason: Some("cluster of 2".into()),
                     editor: Editor::Ai,
                 },
@@ -824,7 +831,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Working on Palamedes in Rust".into(),
-                    confidence: 0.9,
+                    confidence: Some(0.9),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -842,7 +849,7 @@ mod tests {
                 parent_summary_id: None,
                 initial_version: NewVersion {
                     statement: "Builds Rust + Tauri apps in general".into(),
-                    confidence: 0.7,
+                    confidence: Some(0.7),
                     reason: None,
                     editor: Editor::Ai,
                 },
@@ -871,7 +878,7 @@ mod tests {
                 &summary.id,
                 NewVersion {
                     statement: "Specifically building Palamedes (Rust + Tauri personal AI tool)".into(),
-                    confidence: 0.9,
+                    confidence: Some(0.9),
                     reason: Some("user corrected — too general".into()),
                     editor: Editor::User,
                 },
