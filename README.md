@@ -6,6 +6,12 @@ Audit-grade, local-first AI memory: see what your AI believes about you, see
 *why* it believes it, and correct it when it's wrong — so its advice stays
 grounded in your real situation.
 
+> **Status: pre-launch, dogfooding.** Public so the open Belief Schema MCP
+> standard has a public reference implementation. Feature-complete enough to
+> use day-to-day; the [Known limitations](#known-limitations) section is the
+> live punch list. Formal launch ~6 weeks out — see [docs/ANALYSIS.md](docs/ANALYSIS.md)
+> for the roadmap.
+
 ## Why
 
 Good advice needs your situation. Your AI keeps forgetting it — or remembering
