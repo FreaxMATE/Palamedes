@@ -163,12 +163,15 @@ impl Db {
              WHERE key = 'embedding_model' AND value = 'Qwen/Qwen3-Embedding-0.6B'",
             params![crate::embeddings::DEFAULT_EMBEDDING_MODEL],
         )?;
-        // Auto-drop vec_beliefs if the configured EMBEDDING_DIM has changed
-        // from the existing table's dim. Probes by attempting a 1-dim insert
-        // and dropping if the schema rejects it for a different reason than
-        // dim mismatch... actually simpler: try inserting a zero-vector of
-        // EMBEDDING_DIM and drop+recreate on dim error. Since we wrap with
-        // IF NOT EXISTS, the schema's CREATE will then recreate at the new dim.
+        // Detect a vec_beliefs dim mismatch (the configured EMBEDDING_DIM
+        // changed from what was last embedded). Old behavior: silently
+        // DROP the table — that destroyed every existing embedding without
+        // warning. New behavior: preserve the old vectors in a regular
+        // vec_beliefs_legacy_<dim> table, then drop + recreate the virtual
+        // table at the new dim. The UI sees the pending-swap state via
+        // `get_embedding_swap_state` and surfaces it; the existing
+        // `embed_unembedded_beliefs` background loop will re-embed the
+        // user's beliefs at the new dim.
         let test_blob = crate::embeddings::vec_to_blob(&vec![0.0_f32; crate::embeddings::EMBEDDING_DIM])
             .expect("EMBEDDING_DIM must be valid");
         let probe = conn.execute(
@@ -177,17 +180,13 @@ impl Db {
         );
         match probe {
             Ok(_) => {
-                // Probe succeeded — table is at the right dim. Clean up.
                 let _ = conn.execute(
                     "DELETE FROM vec_beliefs WHERE belief_id = '__dim_probe__'",
                     [],
                 );
             }
             Err(_) => {
-                // Either dim mismatch or some other write error. Drop and let
-                // the schema recreate fresh; the user will need to re-embed.
-                conn.execute("DROP TABLE IF EXISTS vec_beliefs", [])?;
-                conn.execute_batch(SCHEMA)?;
+                archive_and_recreate_vec_beliefs(&conn)?;
             }
         }
         // Migrate the previous default from DeepSeek back to Kimi after the
@@ -728,6 +727,185 @@ pub struct DedupCandidate {
     pub statement: String,
     pub status: String,
     pub distance: f64,
+}
+
+/// Parse the column dim out of a `vec_beliefs` CREATE statement.
+/// Looks for `FLOAT[N]` (the syntax sqlite-vec writes for vec0 columns)
+/// and returns `N`. Returns `None` if the table doesn't exist or the
+/// statement doesn't include a recognisable dim.
+fn introspect_vec_beliefs_dim(conn: &Connection) -> Option<usize> {
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='vec_beliefs'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    // sqlite-vec stores something like `embedding FLOAT[4096]`. Pull the
+    // first integer inside square brackets.
+    let open = sql.find('[')?;
+    let close = sql[open..].find(']')?;
+    let inside = &sql[open + 1..open + close];
+    inside.trim().parse::<usize>().ok()
+}
+
+/// Handle a vec_beliefs dim mismatch detected at startup. Preserves the
+/// old embeddings in a `vec_beliefs_legacy_<dim>` regular table so the
+/// user can roll back, drops the old virtual table, and recreates
+/// `vec_beliefs` at the new dim by re-running the schema bundle. Records
+/// pending-swap state in `settings` so the UI can prompt the user.
+///
+/// After this runs, `vec_beliefs` is empty at the new dim. The existing
+/// `embed_unembedded_beliefs` background pass will refill it from the
+/// `beliefs` table on its own.
+fn archive_and_recreate_vec_beliefs(conn: &Connection) -> Result<()> {
+    let old_dim = introspect_vec_beliefs_dim(conn).unwrap_or(0);
+    let new_dim = crate::embeddings::EMBEDDING_DIM;
+    let belief_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM beliefs", [], |r| r.get(0))
+        .unwrap_or(0);
+    let now = Utc::now().to_rfc3339();
+    let legacy_table = format!("vec_beliefs_legacy_{}", old_dim);
+
+    // Archive — best-effort. Skip silently if the source table is in a
+    // shape we can't copy from (e.g. corruption). The user keeps the
+    // belief rows themselves regardless; only the cached vectors are at
+    // risk, and they were going to be wiped under the old behavior too.
+    if old_dim > 0 {
+        let create_legacy = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                 belief_id TEXT PRIMARY KEY,
+                 embedding BLOB
+             )",
+            legacy_table
+        );
+        let _ = conn.execute(&create_legacy, []);
+        let copy = format!(
+            "INSERT OR IGNORE INTO {} (belief_id, embedding)
+             SELECT belief_id, embedding FROM vec_beliefs",
+            legacy_table
+        );
+        let _ = conn.execute(&copy, []);
+    }
+
+    conn.execute("DROP TABLE IF EXISTS vec_beliefs", [])?;
+    conn.execute_batch(SCHEMA)?;
+
+    let upsert = |k: &str, v: &str| -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![k, v],
+        )?;
+        Ok(())
+    };
+    upsert("embedding_swap_pending", "1")?;
+    upsert("embedding_swap_old_dim", &old_dim.to_string())?;
+    upsert("embedding_swap_new_dim", &new_dim.to_string())?;
+    upsert("embedding_swap_belief_count", &belief_count.to_string())?;
+    upsert("embedding_swap_legacy_table", &legacy_table)?;
+    upsert("embedding_swap_detected_at", &now)?;
+
+    eprintln!(
+        "[palamedes] embedding dim swap: old={} new={}. {} belief(s) need re-embedding. \
+         Old vectors archived to {}.",
+        old_dim, new_dim, belief_count, legacy_table
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingSwapState {
+    pub old_dim: usize,
+    pub new_dim: usize,
+    pub belief_count: i64,
+    pub legacy_table: String,
+    pub detected_at: String,
+}
+
+impl Db {
+    /// `Some(state)` while a previously-detected dim swap is awaiting user
+    /// acknowledgement; `None` once dismissed via
+    /// [`Self::confirm_embedding_swap`] or [`Self::dismiss_embedding_swap`].
+    pub fn get_embedding_swap_state(&self) -> Result<Option<EmbeddingSwapState>> {
+        let conn = self.conn.lock().unwrap();
+        let pending: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='embedding_swap_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if pending.as_deref() != Some("1") {
+            return Ok(None);
+        }
+        let read = |k: &str| -> Result<String> {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![k],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(Into::into)
+        };
+        Ok(Some(EmbeddingSwapState {
+            old_dim: read("embedding_swap_old_dim")?.parse().unwrap_or(0),
+            new_dim: read("embedding_swap_new_dim")?.parse().unwrap_or(0),
+            belief_count: read("embedding_swap_belief_count")?.parse().unwrap_or(0),
+            legacy_table: read("embedding_swap_legacy_table")?,
+            detected_at: read("embedding_swap_detected_at")?,
+        }))
+    }
+
+    /// User accepted the swap: drop the legacy archive and clear the
+    /// pending-state flags. (The empty `vec_beliefs` is already in place;
+    /// the background `embed_unembedded_beliefs` pass refills it.)
+    pub fn confirm_embedding_swap(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let legacy: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='embedding_swap_legacy_table'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(table) = legacy {
+            // Cheap sanity check before constructing dynamic SQL — the
+            // legacy table name is generated by us, but a paranoid check
+            // costs nothing.
+            if table.starts_with("vec_beliefs_legacy_")
+                && table[19..].chars().all(|c| c.is_ascii_digit())
+            {
+                let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
+                conn.execute(&drop_sql, [])?;
+            }
+        }
+        clear_swap_flags(&conn)?;
+        Ok(())
+    }
+
+    /// User dismissed the warning without re-embedding. Keeps the legacy
+    /// archive on disk for manual recovery; just clears the flag so the
+    /// banner doesn't keep popping up.
+    pub fn dismiss_embedding_swap(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        clear_swap_flags(&conn)?;
+        Ok(())
+    }
+}
+
+fn clear_swap_flags(conn: &Connection) -> Result<()> {
+    for k in [
+        "embedding_swap_pending",
+        "embedding_swap_old_dim",
+        "embedding_swap_new_dim",
+        "embedding_swap_belief_count",
+        "embedding_swap_legacy_table",
+        "embedding_swap_detected_at",
+    ] {
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![k])?;
+    }
+    Ok(())
 }
 
 /// Phase C migration: extend `belief_provenance.source_type` CHECK to accept

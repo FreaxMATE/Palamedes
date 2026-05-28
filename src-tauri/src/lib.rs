@@ -1637,6 +1637,31 @@ async fn mcp_revoke_client(state: State<'_, AppState>, client_id: String) -> Res
         .map_err(|e| e.to_string())
 }
 
+/// Pending vec_beliefs dim swap, if any. Read at app startup so the UI
+/// can surface the situation. Closes the silent-data-loss gap flagged
+/// in docs/ANALYSIS.md §2.7.
+#[tauri::command]
+async fn get_embedding_swap_state(
+    state: State<'_, AppState>,
+) -> Result<Option<db::EmbeddingSwapState>, String> {
+    state.db.get_embedding_swap_state().map_err(|e| e.to_string())
+}
+
+/// User accepted the swap: drop the legacy `vec_beliefs_legacy_<dim>`
+/// archive and clear the pending flags. The background
+/// `embed_unembedded_beliefs` loop will refill the new vec_beliefs.
+#[tauri::command]
+async fn confirm_embedding_swap(state: State<'_, AppState>) -> Result<(), String> {
+    state.db.confirm_embedding_swap().map_err(|e| e.to_string())
+}
+
+/// User dismissed the warning without re-embedding. Keeps the legacy
+/// archive intact for manual recovery and just clears the banner flag.
+#[tauri::command]
+async fn dismiss_embedding_swap(state: State<'_, AppState>) -> Result<(), String> {
+    state.db.dismiss_embedding_swap().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn mcp_rotate_token(state: State<'_, AppState>) -> Result<McpStatus, String> {
     let new_token = mcp::server::generate_token();
@@ -1842,6 +1867,9 @@ pub fn run() {
             mcp_list_proposals,
             mcp_accept_proposal,
             mcp_reject_proposal,
+            get_embedding_swap_state,
+            confirm_embedding_swap,
+            dismiss_embedding_swap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

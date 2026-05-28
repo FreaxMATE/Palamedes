@@ -11,7 +11,11 @@
     sendMessage,
     setBranchTitle,
     setCurrentLeaf,
+    getEmbeddingSwapState,
+    confirmEmbeddingSwap,
+    dismissEmbeddingSwap,
     type Conversation,
+    type EmbeddingSwapState,
     type Message,
     type StreamHandle,
   } from "./lib/chat";
@@ -64,6 +68,10 @@
   let auditTargetBelief: string | null = $state(null);
   let showRecap = $state(false);
   let showGraph = $state(false);
+  // Pending embedding-model swap, surfaced at startup so the user can
+  // confirm the discard of the legacy backup or dismiss the warning.
+  let embeddingSwap: EmbeddingSwapState | null = $state(null);
+  let embeddingSwapBusy = $state(false);
   let scrollEl: HTMLDivElement;
   let textareaEl: HTMLTextAreaElement;
   let scrollPositions = new Map<string, number>();
@@ -241,6 +249,9 @@
     ensureModels().catch(() => {});
     textareaEl?.focus();
     maybeAutoOpenRecap();
+    getEmbeddingSwapState()
+      .then((s) => (embeddingSwap = s))
+      .catch(() => {});
 
     // Global keyboard shortcuts.
     const onKey = (e: KeyboardEvent) => {
@@ -297,6 +308,32 @@
       scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior: "auto" });
     }
     textareaEl?.focus();
+  }
+
+  async function onConfirmEmbeddingSwap() {
+    if (embeddingSwapBusy) return;
+    embeddingSwapBusy = true;
+    try {
+      await confirmEmbeddingSwap();
+      embeddingSwap = null;
+    } catch (e) {
+      error = `Embedding swap: ${e}`;
+    } finally {
+      embeddingSwapBusy = false;
+    }
+  }
+
+  async function onDismissEmbeddingSwap() {
+    if (embeddingSwapBusy) return;
+    embeddingSwapBusy = true;
+    try {
+      await dismissEmbeddingSwap();
+      embeddingSwap = null;
+    } catch (e) {
+      error = `Embedding swap: ${e}`;
+    } finally {
+      embeddingSwapBusy = false;
+    }
   }
 
   // Deep-link from the audit panel to the exact message a belief was
@@ -583,6 +620,39 @@
         <Icon name={themeState.current === "dark" ? "sun" : "moon"} size={15} label="toggle theme" />
       </button>
     </div>
+    {#if embeddingSwap}
+      <div
+        class="px-4 py-2.5 text-sm pal-warn-soft-bg flex items-center gap-3"
+        style="border-bottom: 1px solid var(--pal-border);"
+        in:fly={{ y: -6, duration: 180 }}
+      >
+        <div class="flex-1 min-w-0">
+          <span class="pal-warn-text font-medium">Embedding model changed.</span>
+          <span class="pal-dim">
+            {embeddingSwap.belief_count} belief{embeddingSwap.belief_count === 1 ? "" : "s"} need re-embedding
+            ({embeddingSwap.old_dim} → {embeddingSwap.new_dim} dims).
+            Old vectors are archived in <code>{embeddingSwap.legacy_table}</code> until you confirm.
+          </span>
+        </div>
+        <button
+          onclick={onConfirmEmbeddingSwap}
+          disabled={embeddingSwapBusy}
+          class="hdr-btn"
+          title="Discard archived vectors and continue re-embedding in the background"
+        >
+          <Icon name="check" size={13} label="confirm" />
+          <span>Re-embed</span>
+        </button>
+        <button
+          onclick={onDismissEmbeddingSwap}
+          disabled={embeddingSwapBusy}
+          class="hdr-btn"
+          title="Dismiss for now. Archive stays on disk."
+        >
+          <span>Dismiss</span>
+        </button>
+      </div>
+    {/if}
     <div
       bind:this={scrollEl}
       onscroll={onScroll}

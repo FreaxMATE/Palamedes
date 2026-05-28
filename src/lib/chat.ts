@@ -548,3 +548,28 @@ export const mcpAcceptProposal = (
 
 export const mcpRejectProposal = (proposalId: string) =>
   invoke<void>("mcp_reject_proposal", { proposalId });
+
+// ---------- embedding-model swap ----------
+
+/** Pending vec_beliefs dim swap, surfaced at startup so the user can
+ *  confirm or dismiss before old vectors are discarded. */
+export interface EmbeddingSwapState {
+  old_dim: number;
+  new_dim: number;
+  belief_count: number;
+  legacy_table: string;
+  detected_at: string;
+}
+
+export const getEmbeddingSwapState = () =>
+  invoke<EmbeddingSwapState | null>("get_embedding_swap_state");
+
+/** Accept the swap: drop the legacy backup, clear the banner. The
+ *  background embed loop will refill vec_beliefs at the new dim. */
+export const confirmEmbeddingSwap = () =>
+  invoke<void>("confirm_embedding_swap");
+
+/** Dismiss the warning without dropping the legacy archive — the user
+ *  can manually recover later by inspecting vec_beliefs_legacy_<dim>. */
+export const dismissEmbeddingSwap = () =>
+  invoke<void>("dismiss_embedding_swap");
