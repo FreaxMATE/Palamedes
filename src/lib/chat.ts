@@ -98,10 +98,17 @@ export type BeliefStatus =
 
 export type TrustClass = "asserted" | "inferred" | "hypothesized" | "summary";
 
+// Confidence is never a self-reported number. It is derived structurally
+// (reinforcement + recency + trust class) and surfaced as a coarse bucket.
+export type ConfidenceBucket = "strong" | "moderate" | "tentative";
+
 export interface AuditBelief {
   id: string;
   statement: string;
-  confidence: number;
+  /** Structural score [0,1] — for sorting/opacity, not display. */
+  effective_confidence: number;
+  /** Coarse bucket shown in the UI. */
+  confidence_bucket: ConfidenceBucket;
   category: string | null;
   status: BeliefStatus;
   trust_class: TrustClass;
@@ -124,13 +131,14 @@ export interface ProvenanceItem {
     | "corrected_by"
     | "summarizes";
   preview: string | null;
+  /** For turn sources: the conversation to deep-link to. */
+  conversation_id: string | null;
   created_at: string;
 }
 
 export interface VersionItem {
   version_num: number;
   statement: string;
-  confidence: number;
   reason: string | null;
   editor: "user" | "ai" | "system";
   created_at: string;
@@ -147,7 +155,6 @@ export interface UpdateBeliefArgs {
   newStatus?: BeliefStatus;
   newTrustClass?: TrustClass;
   newStatement?: string;
-  newConfidence?: number;
   reason?: string;
   blocklistPattern?: string;
 }
@@ -222,12 +229,10 @@ export interface MergeCandidate {
   a_statement: string;
   a_status: BeliefStatus;
   a_trust_class: TrustClass;
-  a_confidence: number;
   b_id: string;
   b_statement: string;
   b_status: BeliefStatus;
   b_trust_class: TrustClass;
-  b_confidence: number;
   cosine: number;
   tier: "definite" | "likely";
 }
@@ -244,6 +249,38 @@ export interface MergeBeliefsArgs {
 export const mergeBeliefs = (args: MergeBeliefsArgs) =>
   invoke<void>("merge_beliefs", { args });
 
+/** Mark a candidate pair as "not a duplicate" — it stops surfacing in the
+ *  review list and is never auto-merged. */
+export const dismissMergeCandidate = (aId: string, bId: string) =>
+  invoke<void>("dismiss_merge_candidate", { args: { aId, bId } });
+
+/** Auto-merge the "definite" near-duplicates in the background. Returns count. */
+export const autoMergeDuplicates = () =>
+  invoke<number>("auto_merge_duplicates");
+
+/** One-click batch: merge every currently-surfaced candidate pair. */
+export const mergeAllCandidates = () =>
+  invoke<number>("merge_all_candidates");
+
+export interface MergeRecord {
+  id: string;
+  keeper_id: string;
+  keeper_statement: string;
+  absorbed_id: string;
+  absorbed_statement: string;
+  cosine: number | null;
+  kind: "auto" | "manual";
+  created_at: string;
+}
+
+/** Recent, not-yet-reverted merges — the digest with Undo. */
+export const recentMerges = (limit?: number) =>
+  invoke<MergeRecord[]>("recent_merges", { limit: limit ?? null });
+
+/** Reverse a merge: restores the absorbed belief and re-indexes it. */
+export const undoMerge = (mergeId: string) =>
+  invoke<void>("undo_merge", { mergeId });
+
 // ---------- memory map ----------
 
 export interface GraphBelief {
@@ -256,6 +293,7 @@ export interface GraphBelief {
   level: number;
   parent_summary_id: string | null;
   confidence: number;
+  confidence_bucket: ConfidenceBucket;
   reinforced_count: number;
   created_at: string;
   last_reinforced_at: string | null;
@@ -491,7 +529,6 @@ export interface Proposal {
 export interface AcceptProposalOverride {
   statement?: string;
   category?: string;
-  confidence?: number;
   trustClass?: TrustClass;
 }
 
@@ -506,7 +543,6 @@ export const mcpAcceptProposal = (
     proposalId,
     statement: override?.statement,
     category: override?.category,
-    confidence: override?.confidence,
     trustClass: override?.trustClass,
   });
 
