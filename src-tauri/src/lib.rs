@@ -33,8 +33,6 @@ use merge::{
 };
 // Internal merge helpers used by the tests at the bottom of this file.
 #[cfg(test)]
-use merge::MergeCandidate;
-#[cfg(test)]
 use merge::{merge_in_tx, pick_keeper, undo_merge_in_conn};
 
 use db::{find_top_dedup_match, Artifact, Conversation, Db, Message as DbMessage};

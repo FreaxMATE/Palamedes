@@ -1,0 +1,68 @@
+# Minimal CI: Rust tests + Svelte type checks on every push / PR.
+# Heavy-weight signed-installer builds live in release.yml and only fire on
+# version tags so we don't burn a Tauri build matrix on every commit.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --all-features --no-fail-fast
+
+      # cargo clippy is intentionally omitted for now — week 2 will add it
+      # back after a one-shot pass to clear pre-existing style warnings.
+
+  svelte:
+    name: svelte-check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm exec svelte-check --tsconfig ./tsconfig.app.json

@@ -1,0 +1,158 @@
+# Release pipeline: build signed installers for macOS, Linux, and Windows,
+# upload them to a GitHub Release draft.
+#
+# - Trigger by pushing a tag matching `v*` (e.g. `v0.1.0-beta.1`) or by
+#   running the workflow manually from the Actions UI.
+# - tauri-action handles the matrix per-OS build and upload. The first
+#   completing job creates a draft release; subsequent jobs append assets.
+# - Code signing + Tauri Updater signing are wired in via secrets but
+#   left **optional**. A release without these secrets still ships valid
+#   installers — they'll just trip the OS gatekeeper warnings the first
+#   time. ANALYSIS.md §4 week 1: signed binaries beat `curl | bash`, but
+#   a missing notarization key shouldn't block a release.
+#
+# Required secrets (configure in repo settings → secrets → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY        — for the Tauri updater (optional)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   APPLE_CERTIFICATE                — base64 of the .p12 (optional, macOS only)
+#   APPLE_CERTIFICATE_PASSWORD
+#   APPLE_SIGNING_IDENTITY           — e.g. "Developer ID Application: …"
+#   APPLE_ID                         — for notarization
+#   APPLE_PASSWORD                   — app-specific password
+#   APPLE_TEAM_ID
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag for the manual release (e.g. v0.1.0-beta.2)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS universal — one bundle that runs on both architectures.
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          # Linux on 22.04 for a broader glibc baseline than the latest
+          # ubuntu-latest runner gives us.
+          - platform: ubuntu-22.04
+            args: ""
+            rust-targets: ""
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Cargo registry + target
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build + sign + upload
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Tauri updater signing — used only when TAURI_SIGNING_PRIVATE_KEY
+          # is set. A missing key is not an error; the action just skips
+          # the updater signature step.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS code signing + notarization. Same — all optional.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ inputs.release_tag || github.ref_name }}
+          releaseName: "Palamedes ${{ inputs.release_tag || github.ref_name }}"
+          releaseBody: |
+            Audit-grade AI memory — see [README](https://github.com/${{ github.repository }}#readme) and [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for what's new.
+
+            **Installers below.** The download is local-only — no telemetry, no
+            account, no curl-pipe-bash. Verify with the SHA-256 sums in the
+            assets list.
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') || contains(inputs.release_tag, '-') }}
+          args: ${{ matrix.args }}
+
+  checksums:
+    name: Publish SHA-256 checksums
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist --pattern '*' || true
+          ls -la dist/
+
+      - name: Compute checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload checksums file to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release upload "$TAG" dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
