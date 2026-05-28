@@ -57,9 +57,10 @@ ruled out.
 ## The Belief Schema
 
 The shape of an auditable, correctable memory — `{ statement, confidence,
-status, trust_class, version, provenance[] }` — is published as the **Belief
-Schema for MCP** ([docs/BELIEF_SCHEMA_MCP.md](docs/BELIEF_SCHEMA_MCP.md),
-CC-BY-SA-4.0). Palamedes is the reference implementation. Fork it.
+status, trust_class, version, provenance[] }` — is the data primitive
+Palamedes is built around. A standalone, language-neutral spec is in
+preparation; for now the canonical reference is the Rust source under
+`src-tauri/src/ledger.rs` and the SQLite schema in `src-tauri/schema.sql`.
 
 ## Known limitations
 
