@@ -93,6 +93,39 @@
   const REPLAY_DAYS_PER_SEC = 3.0;
   let replayLastFrame = 0;
 
+  // Human-friendly date formatters for the time controls. Avoids ISO
+  // strings ("2026-05-28T…") in the chrome.
+  const MONTHS = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ];
+
+  function fmtShortDate(ms: number): string {
+    const d = new Date(ms);
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    const month = MONTHS[d.getMonth()];
+    return sameYear
+      ? `${month} ${d.getDate()}`
+      : `${month} ${d.getDate()}, ${d.getFullYear()}`;
+  }
+
+  /** "now", "12m ago", "3h ago", "5d ago", "2w ago", "4mo ago", "1y ago". */
+  function fmtRelative(ms: number): string {
+    const diff = Date.now() - ms;
+    if (diff < 60_000) return "now";
+    const m = Math.floor(diff / 60_000);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    if (d < 14) return `${d}d ago`;
+    const w = Math.floor(d / 7);
+    if (w < 9) return `${w}w ago`;
+    const mo = Math.floor(d / 30);
+    if (mo < 18) return `${mo}mo ago`;
+    return `${Math.floor(d / 365)}y ago`;
+  }
+
   // Stale corner (Phase D)
   let staleCornerOn = $state(false);
 
@@ -776,7 +809,7 @@
       ctx.arc(cx, cy, cr, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = P.inkFaint;
-      ctx.font = `500 ${9 * dpr}px "JetBrains Mono", ui-monospace, monospace`;
+      ctx.font = `500 ${9 * dpr}px "IBM Plex Mono", ui-monospace, monospace`;
       ctx.textAlign = "left";
       ctx.fillText("STALE > 90d", cx - 28 * dpr, cy + cr - 4 * dpr);
     }
@@ -1090,7 +1123,7 @@
     ctx.fillStyle = isSummary ? P.ink : P.inkSoft;
     ctx.font = isSummary
       ? `italic 500 ${fontSize * dpr}px "Newsreader", Georgia, serif`
-      : `500 ${fontSize * dpr}px "JetBrains Mono", ui-monospace, monospace`;
+      : `500 ${fontSize * dpr}px "IBM Plex Mono", ui-monospace, monospace`;
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     // Backplate behind the text so it stays legible over edges.
@@ -1296,12 +1329,12 @@
     const P = palette;
     ctx.save();
     ctx.fillStyle = P.inkFaint;
-    ctx.font = `500 ${9 * dpr}px "JetBrains Mono", ui-monospace, monospace`;
+    ctx.font = `500 ${9 * dpr}px "IBM Plex Mono", ui-monospace, monospace`;
 
     ctx.textAlign = "left";
     ctx.fillText(
       `CH·1  UMAP·2D  n=${leafCount}  ${activeEdges.length} edges  ${
-        scrubberMs ? `t=${new Date(scrubberMs).toISOString().slice(0, 10)}` : "TRACKING"
+        scrubberMs ? `as of ${fmtShortDate(scrubberMs)}` : "live"
       }`,
       16 * dpr, 20 * dpr,
     );
@@ -1650,7 +1683,7 @@
       </h2>
       <span
         class="text-[11px] truncate"
-        style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+        style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                color: {themeState.current === 'light' ? 'rgba(42,42,46,0.55)' : 'rgba(207,210,216,0.50)'};"
       >
         {status}
@@ -1660,7 +1693,7 @@
         placeholder="search beliefs…"
         bind:value={searchQuery}
         class="ml-2 px-2 py-1 text-[11px] outline-none w-44"
-        style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+        style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                background: {themeState.current === 'light' ? 'rgba(42,42,46,0.05)' : 'rgba(207,210,216,0.06)'};
                border: 1px solid {themeState.current === 'light' ? 'rgba(42,42,46,0.15)' : 'rgba(207,210,216,0.10)'};
                border-radius: 4px;
@@ -1669,7 +1702,7 @@
     </div>
 
     <div class="flex items-center gap-3 text-[11px] relative"
-         style="font-family: 'JetBrains Mono', ui-monospace, monospace;">
+         style="font-family: 'IBM Plex Mono', ui-monospace, monospace;">
       <!-- Trust class quick-toggles. The four most-used filters get top-level chips. -->
       <label class="flex items-center gap-1.5 cursor-pointer">
         <input type="checkbox" bind:checked={filterAsserted} />
@@ -1697,8 +1730,9 @@
       <button
         onclick={timeMode ? disableTime : enableTime}
         class="opacity-60 hover:opacity-100"
-        title="Time scrubber + replay"
-      >{timeMode ? "⏵ replay" : "▶ replay"}</button>
+        class:active={timeMode}
+        title={timeMode ? "Back to live view" : "Scrub through the ledger's history"}
+      >{timeMode ? "● live" : "⌛ time"}</button>
       <button onclick={resetView} class="opacity-60 hover:opacity-100" title="Reset zoom + pan">⊕</button>
       <button
         onclick={() => (advancedOpen = !advancedOpen)}
@@ -1798,21 +1832,21 @@
     </div>
   </div>
 
-  <!-- Time scrubber (Phase D) -->
+  <!-- Time scrubber. As-of label + replay speed indicator + jump-to-live. -->
   {#if timeMode}
     <div
-      class="px-4 py-2 flex items-center gap-3 text-[10px]"
-      style="font-family: 'JetBrains Mono', ui-monospace, monospace;
-             border-bottom: 1px solid {themeState.current === 'light'
-               ? 'rgba(42,42,46,0.08)'
-               : 'rgba(207,210,216,0.06)'};
-             color: {themeState.current === 'light' ? 'rgba(42,42,46,0.65)' : 'rgba(207,210,216,0.60)'};"
+      class="px-4 py-2 flex items-center gap-3 text-[10px] pal-dim"
+      style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
+             border-bottom: 1px solid var(--pal-border);"
     >
       <button
         onclick={replayPlaying ? pauseReplay : startReplay}
         class="opacity-70 hover:opacity-100"
+        title={replayPlaying
+          ? `Pause (replaying ~${REPLAY_DAYS_PER_SEC}d/s)`
+          : `Replay from start (~${REPLAY_DAYS_PER_SEC}d/s)`}
       >{replayPlaying ? "⏸" : "▶"}</button>
-      <span>{new Date(timeBounds.min).toISOString().slice(0, 10)}</span>
+      <span>{fmtShortDate(timeBounds.min)}</span>
       <input
         type="range"
         min={timeBounds.min}
@@ -1824,11 +1858,30 @@
           replayPlaying = false;
         }}
         class="flex-1"
+        aria-label="Scrub the belief ledger through time"
       />
-      <span>{new Date(timeBounds.max).toISOString().slice(0, 10)}</span>
-      <span style="opacity: 0.7;">
-        @ {scrubberMs ? new Date(scrubberMs).toISOString().slice(0, 10) : "now"}
+      <span>{fmtShortDate(timeBounds.max)}</span>
+      {#if replayPlaying}
+        <span class="pal-accent-text" title="Replay speed">~{REPLAY_DAYS_PER_SEC}d/s</span>
+      {/if}
+      <span style="opacity: 0.85;">
+        {#if scrubberMs}
+          as of <span class="pal-accent-text">{fmtShortDate(scrubberMs)}</span>
+          <span class="opacity-60">({fmtRelative(scrubberMs)})</span>
+        {:else}
+          <span class="pal-accent-text">live</span>
+        {/if}
       </span>
+      {#if scrubberMs}
+        <button
+          onclick={() => {
+            scrubberMs = null;
+            replayPlaying = false;
+          }}
+          class="opacity-60 hover:opacity-100"
+          title="Jump back to live"
+        >↺ live</button>
+      {/if}
     </div>
   {/if}
 
@@ -1860,7 +1913,7 @@
               color: {themeState.current === 'light' ? '#2a2a2e' : '#e8dccb'};
               border: 1px solid {themeState.current === 'light' ? 'rgba(42,42,46,0.18)' : 'rgba(232,220,203,0.18)'};
               backdrop-filter: blur(8px);
-              font-family: 'JetBrains Mono', ui-monospace, monospace;"
+              font-family: 'IBM Plex Mono', ui-monospace, monospace;"
           >
             {projecting ? "Projecting…" : "Loading…"}
           </div>
@@ -1884,7 +1937,7 @@
         >
           <div
             class="flex items-center gap-2 mb-1"
-            style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+            style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                    font-size: 9px;
                    letter-spacing: 0.10em;
                    text-transform: uppercase;
@@ -1907,7 +1960,7 @@
           </p>
           <p
             class="mt-1.5 flex gap-2.5 flex-wrap"
-            style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+            style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                    font-size: 9px;
                    color: {themeState.current === 'light' ? 'rgba(42,42,46,0.50)' : 'rgba(232,220,203,0.45)'};"
           >
@@ -1930,7 +1983,7 @@
             color: {themeState.current === 'light' ? '#2a2a2e' : '#e8dccb'};
             border: 1px solid {themeState.current === 'light' ? 'rgba(42,42,46,0.18)' : 'rgba(232,220,203,0.18)'};
             border-radius: 6px;
-            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
             font-size: 11px;"
         >
           <div style="opacity: 0.7;">{edgeLabel(hoveredEdge.kind)} · weight {hoveredEdge.weight.toFixed(2)}</div>
@@ -1949,7 +2002,7 @@
             color: inherit;
             border: 1px solid {themeState.current === 'light' ? 'rgba(42,42,46,0.18)' : 'rgba(232,220,203,0.18)'};
             border-radius: 6px;
-            font-family: 'JetBrains Mono', ui-monospace, monospace;"
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;"
         >
           <div class="flex items-center justify-between mb-2">
             <strong>Legend</strong>
@@ -2036,7 +2089,7 @@
         <p class="text-sm">{selected.belief.statement}</p>
         <p
           class="mt-1"
-          style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+          style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                  font-size: 11px;
                  color: {themeState.current === 'light' ? 'rgba(42,42,46,0.55)' : 'rgba(207,210,216,0.55)'};"
         >
@@ -2049,7 +2102,7 @@
           <div class="mt-4">
             <div
               class="flex items-center justify-between mb-1.5 text-[10px]"
-              style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+              style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                      opacity: 0.65; text-transform: uppercase; letter-spacing: 0.08em;"
             >
               <span>Cited in {turnsForSelected.length} turn{turnsForSelected.length === 1 ? '' : 's'}</span>
@@ -2072,7 +2125,7 @@
                     cursor: pointer;"
                 >
                   <div
-                    style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+                    style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                            font-size: 9px; opacity: 0.55;"
                   >
                     rank #{t.rank + 1} · {t.created_at.slice(0, 10)} · {t.conversation_title}
@@ -2097,7 +2150,7 @@
             >
               <div
                 class="flex items-center justify-between"
-                style="font-family: 'JetBrains Mono', ui-monospace, monospace;
+                style="font-family: 'IBM Plex Mono', ui-monospace, monospace;
                        font-size: 10px;
                        color: {themeState.current === 'light' ? 'rgba(42,42,46,0.55)' : 'rgba(207,210,216,0.55)'};"
               >
