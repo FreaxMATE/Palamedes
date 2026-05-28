@@ -466,11 +466,16 @@ async fn retrieve_for_query(
     hits
 }
 
-/// Write recall_receipts rows linking a turn to the beliefs that grounded it.
+/// Write recall_receipts rows linking a turn to the beliefs that grounded it,
+/// and increment the materialized `belief_co_recall` table for each unordered
+/// pair of beliefs co-recalled in this same turn. The co_recall table is what
+/// the memory-map "two beliefs cited together" edges read from — keeping it up
+/// to date incrementally avoids the O(receipts²) self-join on every map open.
 fn write_receipts(db: &Db, turn_id: &str, retrieved: &[RetrievedBelief]) {
     if retrieved.is_empty() {
         return;
     }
+    let now = chrono::Utc::now().to_rfc3339();
     let _ = db.with_conn(|conn| {
         let tx = conn.unchecked_transaction()?;
         for (i, r) in retrieved.iter().enumerate() {
@@ -489,6 +494,31 @@ fn write_receipts(db: &Db, turn_id: &str, retrieved: &[RetrievedBelief]) {
                 ],
             )?;
         }
+
+        // Upsert one row per unordered pair of distinct beliefs in this turn.
+        // The PRIMARY KEY check on (a < b) is enforced by the canonical-order
+        // CHECK constraint added in migration 0004.
+        for i in 0..retrieved.len() {
+            for j in (i + 1)..retrieved.len() {
+                let (a, b) = if retrieved[i].belief_id < retrieved[j].belief_id {
+                    (&retrieved[i].belief_id, &retrieved[j].belief_id)
+                } else {
+                    (&retrieved[j].belief_id, &retrieved[i].belief_id)
+                };
+                if a == b {
+                    continue; // can't happen given the distinct-id guarantee
+                }
+                tx.execute(
+                    "INSERT INTO belief_co_recall (belief_a_id, belief_b_id, weight, last_seen)
+                     VALUES (?1, ?2, 1, ?3)
+                     ON CONFLICT (belief_a_id, belief_b_id) DO UPDATE
+                       SET weight = weight + 1,
+                           last_seen = excluded.last_seen",
+                    params![a, b, now],
+                )?;
+            }
+        }
+
         tx.commit()?;
         Ok(())
     });

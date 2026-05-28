@@ -273,19 +273,17 @@ pub fn get_graph_edges_extended(
         .with_conn(|conn| {
             let mut edges: Vec<GraphEdge> = Vec::new();
 
-            // Co-recall edges: beliefs that appear together in the same turn's
-            // recall_receipts. Symmetric, so emit (a < b) once.
+            // Co-recall edges: beliefs cited together in the same turn. Now
+            // served from the materialized `belief_co_recall` table that the
+            // chat pipeline maintains incrementally; no more O(receipts²)
+            // self-join on every map open.
             let mut cr_stmt = conn.prepare(
-                "SELECT r1.belief_id, r2.belief_id, COUNT(*) AS w
-                 FROM recall_receipts r1
-                 JOIN recall_receipts r2
-                   ON r1.turn_id = r2.turn_id
-                  AND r1.belief_id < r2.belief_id
-                 JOIN beliefs b1 ON b1.id = r1.belief_id
-                 JOIN beliefs b2 ON b2.id = r2.belief_id
+                "SELECT cr.belief_a_id, cr.belief_b_id, cr.weight
+                 FROM belief_co_recall cr
+                 JOIN beliefs b1 ON b1.id = cr.belief_a_id
+                 JOIN beliefs b2 ON b2.id = cr.belief_b_id
                  WHERE b1.status NOT IN ('blocked')
-                   AND b2.status NOT IN ('blocked')
-                 GROUP BY r1.belief_id, r2.belief_id",
+                   AND b2.status NOT IN ('blocked')",
             )?;
             let cr_rows = cr_stmt.query_map([], |r| {
                 Ok((
