@@ -7,6 +7,7 @@ mod graph;
 mod ledger;
 mod mcp;
 mod merge;
+mod migrations;
 mod nebius;
 mod recap;
 mod summarization;

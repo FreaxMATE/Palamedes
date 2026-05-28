@@ -87,6 +87,10 @@ impl Db {
         }
         migrate_provenance_check_constraint(&conn)?;
         migrate_belief_versions_confidence_nullable(&conn)?;
+        // Numbered-migration runner. Records the baseline as v1 on first
+        // run; from v2 onward, schema changes ship as files under
+        // ../migrations/ and entries in `MIGRATIONS` in migrations.rs.
+        crate::migrations::run(&conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params!["system_prompt", DEFAULT_SYSTEM_PROMPT],
