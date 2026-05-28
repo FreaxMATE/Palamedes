@@ -47,6 +47,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0002_belief_uniq_hash.sql"),
         flags: 0,
     },
+    Migration {
+        version: 3,
+        name: "recall_receipts_composite_index",
+        sql: include_str!("../migrations/0003_recall_receipts_composite_index.sql"),
+        flags: 0,
+    },
 ];
 
 /// Run pending migrations. Safe to call on every startup.
