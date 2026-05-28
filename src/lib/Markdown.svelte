@@ -1,7 +1,7 @@
 <script lang="ts">
   import { marked } from "marked";
   import hljs from "highlight.js";
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
 
   interface Props {
     source: string;
@@ -35,7 +35,11 @@
     return marked.parse(s, { renderer }) as string;
   }
 
-  let html = $state(parse(source));
+  // The initial parse must read `source` exactly once at construction —
+  // subsequent updates flow through the `$effect` below, which handles the
+  // throttled case. `untrack` makes that one-shot intent explicit and
+  // silences svelte-check's `state_referenced_locally` warning.
+  let html = $state(untrack(() => parse(source)));
   let lastParse = 0;
   let pending: number | null = null;
 

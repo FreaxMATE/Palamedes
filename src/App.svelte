@@ -25,6 +25,7 @@
   import ReceiptChips from "./lib/ReceiptChips.svelte";
   import { ensureModels } from "./lib/modelStore";
   import { themeState } from "./lib/theme.svelte";
+  import Icon from "./lib/Icon.svelte";
 
   let conversations: Conversation[] = $state([]);
   let activeId: string | null = $state(null);
@@ -298,6 +299,23 @@
     textareaEl?.focus();
   }
 
+  // Deep-link from the audit panel to the exact message a belief was
+  // extracted from: open the conversation, scroll to it, flash it.
+  async function openSource(conversationId: string, messageId: string) {
+    showAudit = false;
+    auditTargetBelief = null;
+    if (activeId !== conversationId) {
+      await selectConversation(conversationId);
+    }
+    await tick();
+    const el = document.getElementById(`msg-${messageId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("source-flash");
+      setTimeout(() => el.classList.remove("source-flash"), 1600);
+    }
+  }
+
   async function newConversation() {
     if (streaming) return;
     if (activeId && scrollEl) scrollPositions.set(activeId, scrollEl.scrollTop);
@@ -321,6 +339,23 @@
 
   function onScroll() {
     if (activeId && scrollEl) scrollPositions.set(activeId, scrollEl.scrollTop);
+  }
+
+  // WebKitGTK (the Tauri webview on Linux) scrolls inner overflow containers
+  // far slower than the wheel input warrants — a fast flick barely moves. We
+  // drive scrollTop from the raw delta ourselves so it's 1:1 and responsive.
+  // Skip it when the platform delta already looks healthy (e.g. WebKit2 on
+  // macOS reports large pixel deltas), so we don't double-speed there.
+  const SCROLL_SPEED = 1; // multiplier on the normalized pixel delta — bump to taste
+  function onWheel(e: WheelEvent) {
+    if (!scrollEl || e.ctrlKey) return; // ctrl+wheel is browser zoom — leave it
+    // deltaMode 1 = lines, 2 = pages; 0 = pixels. Normalize to pixels.
+    // ~40px/line is a healthy notch; WebKitGTK reports line-mode with tiny steps.
+    const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? scrollEl.clientHeight : 1;
+    const dy = e.deltaY * unit;
+    if (dy === 0) return;
+    scrollEl.scrollTop += dy * SCROLL_SPEED;
+    e.preventDefault();
   }
 
   async function scrollToBottom(behavior: "auto" | "smooth" = "auto") {
@@ -509,42 +544,50 @@
 
   <main class="flex-1 flex flex-col min-w-0">
     <div
-      class="border-b border-neutral-200 dark:border-neutral-800 px-4 py-2 flex justify-end gap-4"
+      class="px-4 py-2.5 flex justify-end items-center gap-1.5"
+      style="border-bottom: 1px solid var(--pal-border);"
     >
       <button
         onclick={() => (showAudit = !showAudit)}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        class="hdr-btn"
+        class:active={showAudit}
         title="Audit what the AI thinks about you (Ctrl+M)"
       >
-        🧠 memory
+        <Icon name="memory" size={14} label="memory" />
+        <span>memory</span>
       </button>
       <button
         onclick={() => (showGraph = !showGraph)}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        class="hdr-btn"
+        class:active={showGraph}
         title="Memory map (Ctrl+G)"
       >
-        ✦ map
+        <Icon name="map" size={14} label="map" />
+        <span>map</span>
       </button>
       <button
         onclick={() => (showTree = !showTree)}
         disabled={!activeId}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-30"
+        class="hdr-btn"
+        class:active={showTree}
         title="Branches (Ctrl+B)"
       >
-        ⎇ branches
+        <Icon name="branches" size={14} label="branches" />
+        <span>branches</span>
       </button>
       <button
         onclick={() => themeState.toggle()}
-        class="text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+        class="hdr-btn hdr-btn-icon"
         title={themeState.current === "dark" ? "Switch to light" : "Switch to dark"}
       >
-        {themeState.current === "dark" ? "☀" : "☾"}
+        <Icon name={themeState.current === "dark" ? "sun" : "moon"} size={15} label="toggle theme" />
       </button>
     </div>
     <div
       bind:this={scrollEl}
       onscroll={onScroll}
-      class="flex-1 overflow-y-auto p-6 space-y-4 scroll-smooth"
+      onwheel={onWheel}
+      class="flex-1 overflow-y-auto p-6 space-y-4"
     >
       {#if !activeId && currentPath.length === 0}
         <div
@@ -555,7 +598,7 @@
             <h2 class="text-2xl font-semibold mb-3 tracking-tight">
               Chat normally.
             </h2>
-            <p class="text-sm text-neutral-500 leading-relaxed">
+            <p class="text-sm pal-dim leading-relaxed">
               I'll keep notes on what I learn about you — confidence and all.
               Press <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">M</kbd>
               any time to audit what's in there.
@@ -567,6 +610,7 @@
         {@const siblings = siblingsOf(messages, msg)}
         {@const idx = siblings.findIndex((s) => s.id === msg.id)}
         <div
+          id="msg-{msg.id}"
           in:fly={{ y: 6, duration: 180 }}
           class="group flex {msg.role === 'user'
             ? 'justify-end'
@@ -574,10 +618,10 @@
         >
           <div class="max-w-[75ch]">
             <div
-              class="rounded-lg px-4 py-2 break-words
+              class="px-4 py-2.5 break-words
                      {msg.role === 'user'
-                       ? 'pal-accent-bg text-white whitespace-pre-wrap'
-                       : 'bg-neutral-100 dark:bg-neutral-800'}"
+                       ? 'bubble bubble-user text-white whitespace-pre-wrap'
+                       : 'bubble bubble-assistant'}"
             >
               {#if editingMessageId === msg.id}
                 <textarea
@@ -707,7 +751,7 @@
                       if (e.key === "Enter") { e.preventDefault(); commitBranchTitle(); }
                       else if (e.key === "Escape") { editingTitleId = null; }
                     }}
-                    class="bg-transparent border border-neutral-300 dark:border-neutral-700 rounded px-1 py-0 text-xs focus:outline-none focus:ring-1 focus:ring-violet-500"
+                    class="bg-transparent border pal-border rounded px-1 py-0 text-xs focus:outline-none focus:ring-1 pal-accent-border"
                     autofocus
                   />
                 {:else if msg.branch_title}
@@ -731,7 +775,7 @@
               </span>
               <button
                 onclick={() => branchFromHere(msg.id)}
-                class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-violet-500"
+                class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:pal-accent-text"
                 disabled={!!streaming}
                 title="Next message will branch from here"
               >
@@ -740,7 +784,7 @@
               {#if msg.role === "user"}
                 <button
                   onclick={() => startEditingMessage(msg)}
-                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-violet-500"
+                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:pal-accent-text"
                   disabled={!!streaming}
                   title="Edit message (creates sibling branch)"
                 >
@@ -750,7 +794,7 @@
               {#if msg.role === "assistant"}
                 <button
                   onclick={() => regenerateMessage(msg)}
-                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:text-violet-500"
+                  class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 hover:pal-accent-text"
                   disabled={!!streaming}
                   title="Regenerate (creates sibling with same history)"
                 >
@@ -775,7 +819,8 @@
     </div>
 
     <div
-      class="border-t border-neutral-200 dark:border-neutral-800 p-4 flex gap-2 items-stretch"
+      class="p-4 flex gap-2 items-stretch"
+      style="border-top: 1px solid var(--pal-border);"
     >
       <textarea
         bind:this={textareaEl}
@@ -783,8 +828,8 @@
         oninput={autoResizeTextarea}
         onkeydown={onKeydown}
         disabled={!!streaming}
-        class="flex-1 resize-none rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 disabled:opacity-50 transition-all"
-        style="min-height: 2.75rem; max-height: 15rem; --tw-ring-color: rgb(var(--pal-accent));"
+        class="composer-input flex-1 resize-none px-3.5 py-2.5 text-sm focus:outline-none disabled:opacity-50 transition-all"
+        style="min-height: 2.75rem; max-height: 15rem;"
         rows="2"
         placeholder="Message Palamedes…"
       ></textarea>
@@ -792,7 +837,8 @@
       {#if streaming}
         <button
           onclick={cancel}
-          class="rounded-md bg-red-500 hover:bg-red-600 text-white px-4 text-sm font-medium self-stretch"
+          class="bg-red-500 hover:bg-red-600 text-white px-4 text-sm font-medium self-stretch pal-shadow"
+          style="border-radius: var(--pal-radius);"
         >
           Stop
         </button>
@@ -802,9 +848,10 @@
             onclick={() => send(true)}
             disabled={!input.trim()}
             title="Send as new branch (Ctrl+Enter) — creates a sibling of the current leaf"
-            class="flex-1 rounded-md border pal-accent-border bg-white dark:bg-neutral-900 pal-accent-text
+            class="flex-1 border pal-accent-border pal-surface pal-accent-text
                    hover:pal-accent-soft-bg disabled:opacity-40
                    px-3 text-xs font-medium inline-flex items-center justify-center gap-1"
+            style="border-radius: var(--pal-radius);"
           >
             <span>↳</span>
             <span>new branch</span>
@@ -813,8 +860,9 @@
             onclick={() => send(false)}
             disabled={!input.trim()}
             title="Send (Enter)"
-            class="flex-1 rounded-md pal-accent-bg hover:opacity-90 disabled:opacity-40
-                   text-white px-3 text-sm font-medium"
+            class="flex-1 pal-accent-bg hover:opacity-90 disabled:opacity-40
+                   text-white px-3 text-sm font-medium pal-shadow"
+            style="border-radius: var(--pal-radius);"
           >
             Send
           </button>
@@ -840,6 +888,7 @@
         auditTargetBelief = null;
       }}
       targetBelief={auditTargetBelief}
+      onOpenSource={openSource}
     />
   {/if}
 
@@ -855,3 +904,66 @@
 {#if showSettings}
   <Settings onClose={() => (showSettings = false)} />
 {/if}
+
+<style>
+  /* Header toolbar buttons — quiet pills that highlight the open panel. */
+  .hdr-btn {
+    font-size: 11px;
+    color: var(--pal-dim);
+    padding: 5px 11px;
+    border-radius: var(--pal-radius);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .hdr-btn:hover:not(:disabled) {
+    color: var(--pal-ink);
+    background: var(--pal-bg-sunken);
+  }
+  .hdr-btn.active {
+    color: rgb(var(--pal-accent));
+    background: var(--pal-accent-soft);
+  }
+  .hdr-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+  .hdr-btn-icon {
+    font-size: 13px;
+  }
+
+  /* Chat bubbles — softened corners + a little air. The assistant bubble
+     lifts off the canvas with a hairline + subtle shadow instead of a flat
+     gray block; the user bubble carries the vermilion accent. */
+  .bubble {
+    line-height: 1.55;
+  }
+  .bubble-assistant {
+    background: var(--pal-surface);
+    border: 1px solid var(--pal-border);
+    border-radius: var(--pal-radius-lg);
+    box-shadow: var(--pal-shadow);
+  }
+  .bubble-user {
+    background: rgb(var(--pal-accent));
+    border-radius: var(--pal-radius-lg);
+  }
+
+  /* Composer — token surface, soft ring on focus. */
+  .composer-input {
+    background: var(--pal-surface);
+    border: 1px solid var(--pal-border);
+    border-radius: var(--pal-radius);
+    color: var(--pal-ink);
+    box-shadow: var(--pal-shadow);
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+  }
+  .composer-input:focus {
+    border-color: rgb(var(--pal-accent));
+    box-shadow: 0 0 0 3px var(--pal-accent-soft);
+  }
+</style>

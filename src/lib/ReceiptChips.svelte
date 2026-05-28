@@ -53,13 +53,13 @@
 {#if loaded && receipts.length > 0}
   <div class="mt-1.5 flex flex-wrap gap-1 items-center">
     <span class="text-[10px] text-neutral-400 uppercase tracking-wider mr-1">
-      Memories used
+      Drew from
     </span>
     {#each receipts as r (r.belief_id)}
       <button
         onclick={() => onOpenAudit(r.belief_id)}
         title={r.statement}
-        class="text-[11px] px-1.5 py-0.5 rounded-full border border-neutral-300 dark:border-neutral-700 bg-white/60 dark:bg-neutral-900/60 text-neutral-700 dark:text-neutral-300 hover:border-violet-400 hover:bg-violet-50 dark:hover:bg-violet-950/40 inline-flex items-center gap-1"
+        class="text-[11px] px-1.5 py-0.5 rounded-full border pal-border pal-surface pal-dim hover:pal-accent-border hover:pal-accent-soft-bg inline-flex items-center gap-1"
       >
         <span>{trustBadge(r.trust_class)}</span>
         <span class="max-w-[180px] truncate">{trim(r.statement)}</span>

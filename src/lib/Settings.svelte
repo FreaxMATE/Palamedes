@@ -7,7 +7,7 @@
   } from "./chat";
   import { ensureModels, getCachedModels } from "./modelStore";
   import { onMount } from "svelte";
-  import { themeState, PALETTES, type Palette } from "./theme.svelte";
+  import { themeState } from "./theme.svelte";
 
   interface Props {
     onClose: () => void;
@@ -317,30 +317,29 @@
     {#if loaded && activeTab === "general"}
       <div class="space-y-5">
         <div>
-          <label class="block text-sm font-medium mb-2">Theme</label>
-          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            {#each PALETTES as p (p.id)}
-              <button
-                type="button"
-                onclick={() => themeState.setPalette(p.id as Palette)}
-                class="text-left rounded-md border p-2 transition-colors
-                       {themeState.palette === p.id
-                  ? 'pal-accent-border pal-accent-soft-bg'
-                  : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-400 dark:hover:border-neutral-600'}"
-              >
-                <div class="text-xs font-medium">{p.label}</div>
-                <div class="text-[10px] text-neutral-500 mt-0.5 leading-tight">{p.blurb}</div>
-              </button>
-            {/each}
-          </div>
-          <p class="text-xs text-neutral-500 mt-2">
-            Affects dark mode. Light mode is unchanged across palettes.
-            Click <button
+          <p class="block text-sm font-medium mb-2">Appearance</p>
+          <div class="flex gap-2">
+            <button
               type="button"
-              onclick={() => themeState.toggle()}
-              class="underline pal-accent-text"
-            >toggle mode</button> to test.
-          </p>
+              onclick={() => themeState.set("light")}
+              class="flex-1 rounded-md border p-2 text-sm transition-colors
+                     {themeState.current === 'light'
+                ? 'pal-accent-border pal-accent-soft-bg'
+                : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-400 dark:hover:border-neutral-600'}"
+            >
+              ☀ Light
+            </button>
+            <button
+              type="button"
+              onclick={() => themeState.set("dark")}
+              class="flex-1 rounded-md border p-2 text-sm transition-colors
+                     {themeState.current === 'dark'
+                ? 'pal-accent-border pal-accent-soft-bg'
+                : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-400 dark:hover:border-neutral-600'}"
+            >
+              ☾ Dark
+            </button>
+          </div>
         </div>
 
         <div>
@@ -457,7 +456,10 @@
                     style="--tw-ring-color: rgb(var(--pal-accent));"
                   />
                   <p class="text-xs text-neutral-500 mt-1">
-                    Drafts above reinforce instead of inserting.
+                    Pairs at or above this merge automatically — new drafts
+                    reinforce the existing belief at extraction, and existing
+                    duplicates collapse in a background sweep (reversible from
+                    the Duplicates tab).
                   </p>
                 </div>
                 <div>
@@ -475,7 +477,8 @@
                     style="--tw-ring-color: rgb(var(--pal-accent));"
                   />
                   <p class="text-xs text-neutral-500 mt-1">
-                    Pairs above this surface in ⇌ Merges.
+                    Pairs above this (but below auto-merge) surface in the
+                    Duplicates tab for one-click review.
                   </p>
                 </div>
               </div>
@@ -610,9 +613,9 @@
           {#if mcp?.url}
             <div class="space-y-2 mb-4">
               <div>
-                <label class="block text-xs font-medium text-neutral-500 mb-1">
+                <p class="block text-xs font-medium text-neutral-500 mb-1">
                   URL
-                </label>
+                </p>
                 <div class="flex gap-2">
                   <code class="flex-1 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 px-2 py-1.5 font-mono">
                     {mcp.url}
@@ -631,9 +634,9 @@
 
           {#if mcp?.token}
             <div class="mb-4">
-              <label class="block text-xs font-medium text-neutral-500 mb-1">
+              <p class="block text-xs font-medium text-neutral-500 mb-1">
                 Bearer token
-              </label>
+              </p>
               <div class="flex gap-2">
                 <code class="flex-1 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 px-2 py-1.5 font-mono truncate">
                   {showToken
@@ -805,3 +808,4 @@
     </div>
   </div>
 </div>
+

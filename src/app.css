@@ -5,61 +5,53 @@
 
 :root {
   color-scheme: light;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: "ss01", "cv11";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  /* Light-mode palette defaults — palettes only override dark for the
-     launch demo. Light mode stays calm-neutral across all palettes. */
-  --pal-bg: #fafafa;
-  --pal-surface: #ffffff;
-  --pal-ink: #171717;
-  --pal-dim: #737373;
-  --pal-border: #e5e5e5;
-  --pal-accent: 139 92 246;        /* violet-500 */
-  --pal-accent-soft: rgba(139, 92, 246, 0.12);
+  /* Default palette — "Civic Archive": vermilion-on-graphite in dark,
+     vermilion-on-warm-paper in light. Vermilion is a chop seal: rare,
+     precious. Ochre is the only other color, reserved for contradiction. */
+  --pal-bg: #f7f3ec;               /* warm off-white canvas */
+  --pal-bg-sunken: #ede8dd;        /* recessed sidebar/chrome */
+  --pal-surface: #fbf8f1;          /* elevated panel */
+  --pal-ink: #1b1b1f;              /* deep ink body text */
+  --pal-dim: #6e6a60;              /* muted, warm-leaning */
+  --pal-border: #e5dfd2;           /* barely-there hairline */
+  --pal-accent: 209 79 63;         /* #D14F3F vermilion / cinnabar */
+  --pal-accent-soft: rgba(209, 79, 63, 0.12);
+  --pal-warn: 184 146 74;          /* #B8924A aged ochre */
+  --pal-warn-soft: rgba(184, 146, 74, 0.14);
+
+  /* Radius scale — the archive is no longer razor-sharp. Soft, modern
+     corners; tiers so tiny chips don't over-round and panels read calm. */
+  --pal-radius-sm: 7px;
+  --pal-radius: 10px;
+  --pal-radius-lg: 16px;
+
+  /* Elevation — warm-tinted, barely-there in light. Cards lift off the
+     canvas instead of being outlined by a hairline alone. */
+  --pal-shadow: 0 1px 2px rgba(27, 27, 31, 0.04), 0 3px 10px rgba(27, 27, 31, 0.06);
+  --pal-shadow-lg: 0 6px 20px rgba(27, 27, 31, 0.09), 0 16px 40px rgba(27, 27, 31, 0.10);
 }
 
 .dark {
   color-scheme: dark;
-  /* "default" dark — current look, neutral-950 ground. */
-  --pal-bg: #0a0a0a;
-  --pal-surface: #171717;
-  --pal-ink: #f5f5f5;
-  --pal-dim: #a3a3a3;
-  --pal-border: #262626;
-  --pal-accent: 139 92 246;
-  --pal-accent-soft: rgba(139, 92, 246, 0.18);
-}
+  --pal-bg: #1e1f23;               /* graphite canvas */
+  --pal-bg-sunken: #15161a;        /* recessed sidebar — matte frame */
+  --pal-surface: #23252a;          /* elevated panel, one tonal step up */
+  --pal-ink: #e8e2d6;              /* warm bone */
+  --pal-dim: #a09a8e;              /* muted warm */
+  --pal-border: #26272b;           /* near-invisible hairline */
+  --pal-accent: 209 79 63;         /* same vermilion in both modes */
+  --pal-accent-soft: rgba(209, 79, 63, 0.18);
+  --pal-warn: 184 146 74;
+  --pal-warn-soft: rgba(184, 146, 74, 0.18);
 
-.dark[data-palette="audit-dark"] {
-  --pal-bg: #0a0a0c;
-  --pal-surface: #15151a;
-  --pal-ink: #e8e6e1;
-  --pal-dim: #7a7a82;
-  --pal-border: #232328;
-  --pal-accent: 167 139 250;      /* #a78bfa violet-400 */
-  --pal-accent-soft: rgba(167, 139, 250, 0.16);
-}
-
-.dark[data-palette="inkwell"] {
-  --pal-bg: #0e0e10;
-  --pal-surface: #18181c;
-  --pal-ink: #f4ecd8;             /* warm paper */
-  --pal-dim: #8a847a;
-  --pal-border: #2a2823;
-  --pal-accent: 212 165 116;      /* #d4a574 parchment */
-  --pal-accent-soft: rgba(212, 165, 116, 0.16);
-}
-
-.dark[data-palette="atrium"] {
-  --pal-bg: #101214;
-  --pal-surface: #171a1c;
-  --pal-ink: #e4e4e7;
-  --pal-dim: #6e7178;
-  --pal-border: #25282c;
-  --pal-accent: 103 232 179;      /* #67e8b3 mint */
-  --pal-accent-soft: rgba(103, 232, 179, 0.14);
+  /* Deeper, softer shadows on the graphite canvas. */
+  --pal-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 4px 14px rgba(0, 0, 0, 0.35);
+  --pal-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.40), 0 20px 48px rgba(0, 0, 0, 0.50);
 }
 
 html, body, #app {
@@ -76,12 +68,47 @@ body {
    sprinkling Tailwind neutrals so a palette swap doesn't require touching
    every component. */
 .pal-surface { background: var(--pal-surface); }
+.pal-bg-sunken { background: var(--pal-bg-sunken); }
 .pal-border { border-color: var(--pal-border); }
 .pal-dim { color: var(--pal-dim); }
 .pal-accent-bg { background: rgb(var(--pal-accent)); }
 .pal-accent-text { color: rgb(var(--pal-accent)); }
 .pal-accent-border { border-color: rgb(var(--pal-accent)); }
 .pal-accent-soft-bg { background: var(--pal-accent-soft); }
+.pal-warn-bg { background: rgb(var(--pal-warn)); }
+.pal-warn-text { color: rgb(var(--pal-warn)); }
+.pal-warn-soft-bg { background: var(--pal-warn-soft); }
+.pal-shadow { box-shadow: var(--pal-shadow); }
+.pal-shadow-lg { box-shadow: var(--pal-shadow-lg); }
+.pal-radius { border-radius: var(--pal-radius); }
+.pal-radius-lg { border-radius: var(--pal-radius-lg); }
+
+/* Inline icon-with-text button — gives the SVG + label a shared centered
+   baseline. Stack with any background/border button class (e.g. `.row-action`). */
+.ic-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  line-height: 1;
+}
+
+/* Civic Archive wordmark: ALL CAPS, wide letter-spacing, monument feel.
+   The hair-thin underline rule is intentional — like a tracked title on
+   a building plate. */
+.wordmark {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  font-weight: 500;
+  font-size: 0.78rem;
+}
+
+/* Tabular numerals via Plex Mono — confidence scores, IDs, timestamps. */
+.num {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
 
 /* Keyboard shortcut badge */
 .kbd {
@@ -235,4 +262,15 @@ body {
 @keyframes thinking-shimmer {
   0%   { background-position: 100% 0; }
   100% { background-position: -100% 0; }
+}
+
+/* Brief highlight when jumping from the audit panel to a belief's source
+   message (provenance "view source" click-through). */
+.source-flash {
+  animation: source-flash 1.6s ease-out;
+  border-radius: 0.5rem;
+}
+@keyframes source-flash {
+  0%   { background-color: rgb(var(--pal-accent) / 0.22); }
+  100% { background-color: transparent; }
 }

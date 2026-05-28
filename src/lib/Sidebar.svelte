@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Conversation } from "./chat";
+  import Icon from "./Icon.svelte";
 
   interface Props {
     conversations: Conversation[];
@@ -40,43 +41,46 @@
 </script>
 
 <aside
-  class="w-64 shrink-0 border-r border-neutral-200 dark:border-neutral-800 flex flex-col"
+  class="w-64 shrink-0 pal-bg-sunken border-r pal-border flex flex-col"
 >
   <div class="px-4 pt-4 pb-3">
     <div class="flex items-center justify-between">
-      <h1 class="text-base font-semibold tracking-tight">Palamedes</h1>
+      <h1 class="wordmark">Palamedes</h1>
       <button
         onclick={onOpenSettings}
         title="Settings"
-        class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 text-base leading-none p-1 -mr-1 rounded hover:bg-neutral-100 dark:hover:bg-neutral-900"
+        class="pal-dim hover:opacity-100 opacity-70 leading-none p-1 -mr-1 rounded inline-flex items-center"
         aria-label="Settings"
       >
-        ⚙
+        <Icon name="settings" size={16} label="settings" />
       </button>
     </div>
     <button
       onclick={onNew}
-      class="mt-3 w-full rounded-md bg-violet-500 hover:bg-violet-600 text-white px-3 py-1.5 text-sm font-medium"
+      class="mt-3 w-full pal-accent-bg hover:opacity-90 text-white px-3 py-2 text-sm font-medium pal-shadow inline-flex items-center justify-center gap-1.5"
+      style="border-radius: var(--pal-radius);"
     >
-      + New chat
+      <Icon name="plus" size={14} label="new" />
+      <span>New chat</span>
     </button>
   </div>
 
   <div class="flex-1 overflow-y-auto pb-4">
     {#if conversations.length === 0}
-      <p class="px-4 pt-2 text-sm text-neutral-500">No conversations yet.</p>
+      <p class="px-4 pt-2 text-sm pal-dim">No conversations yet.</p>
     {/if}
     {#each grouped as group (group.bucket)}
-      <div class="px-3 pt-3 pb-1 text-[11px] uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
+      <div class="px-3 pt-3 pb-1 text-[11px] uppercase tracking-wider pal-dim opacity-70">
         {group.bucket}
       </div>
       <div class="px-2 space-y-0.5">
         {#each group.items as conv (conv.id)}
           <div
-            class="group flex items-center justify-between gap-1 px-2 py-1.5 rounded-md cursor-pointer text-sm
+            class="group flex items-center justify-between gap-1 px-2 py-1.5 cursor-pointer text-sm
                    {activeId === conv.id
-                     ? 'bg-violet-100 dark:bg-violet-900/30 text-violet-900 dark:text-violet-100'
-                     : 'hover:bg-neutral-100 dark:hover:bg-neutral-900 text-neutral-700 dark:text-neutral-300'}"
+                     ? 'pal-accent-soft-bg pal-accent-text'
+                     : 'hover:opacity-100 opacity-90 pal-dim'}"
+            style="border-radius: var(--pal-radius);"
             onclick={() => onSelect(conv.id)}
             onkeydown={(e) => e.key === "Enter" && onSelect(conv.id)}
             role="button"
@@ -88,11 +92,11 @@
                 e.stopPropagation();
                 if (confirm(`Delete "${conv.title}"?`)) onDelete(conv.id);
               }}
-              class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 text-neutral-500 hover:text-red-500 px-1 rounded"
+              class="opacity-0 group-hover:opacity-100 transition-opacity duration-150 pal-dim hover:text-red-500 px-1 rounded inline-flex items-center"
               title="Delete"
               aria-label="Delete conversation"
             >
-              ×
+              <Icon name="close" size={12} label="delete" />
             </button>
           </div>
         {/each}
