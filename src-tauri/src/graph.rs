@@ -81,7 +81,10 @@ pub fn get_graph_snapshot(state: State<'_, AppState>) -> Result<GraphSnapshot, S
                         (SELECT COUNT(*) FROM belief_provenance bp
                           JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
                           WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count,
-                        b.created_at, b.last_reinforced_at,
+                        (SELECT COUNT(*) FROM belief_provenance bp
+                          JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
+                          WHERE bv2.belief_id = b.id AND bp.relation = 'contradicted_by') AS contradicted_count,
+                        b.num_times, b.created_at, b.last_reinforced_at, b.last_observed_at,
                         p.x, p.y,
                         EXISTS(SELECT 1 FROM vec_beliefs v WHERE v.belief_id = b.id) AS has_embedding
                  FROM beliefs b
@@ -91,17 +94,25 @@ pub fn get_graph_snapshot(state: State<'_, AppState>) -> Result<GraphSnapshot, S
             )?;
             let rows = stmt.query_map([], |r| {
                 let trust_class: String = r.get(5)?;
+                let status: String = r.get(4)?;
                 let stored: Option<f64> = r.get(8)?;
                 let reinforced_count: i64 = r.get(9)?;
-                let created_at: String = r.get(10)?;
-                let last_reinforced_at: Option<String> = r.get(11)?;
+                let contradicted_count: i64 = r.get(10)?;
+                let num_times: i64 = r.get(11)?;
+                let created_at: String = r.get(12)?;
+                let last_reinforced_at: Option<String> = r.get(13)?;
+                let last_observed_at: Option<String> = r.get(14)?;
                 // Map opacity / cluster elevation now reflect *structural*
                 // confidence, not a self-reported number.
                 let eff = confidence::effective_for(
                     &trust_class,
                     reinforced_count,
+                    contradicted_count,
+                    num_times,
+                    status == "corrected",
                     &created_at,
                     last_reinforced_at.as_deref(),
+                    last_observed_at.as_deref(),
                     stored,
                 );
                 Ok(GraphBelief {
@@ -109,7 +120,7 @@ pub fn get_graph_snapshot(state: State<'_, AppState>) -> Result<GraphSnapshot, S
                     statement: r.get(1)?,
                     label: r.get(2)?,
                     category: r.get(3)?,
-                    status: r.get(4)?,
+                    status,
                     trust_class,
                     level: r.get(6)?,
                     parent_summary_id: r.get(7)?,
@@ -118,9 +129,9 @@ pub fn get_graph_snapshot(state: State<'_, AppState>) -> Result<GraphSnapshot, S
                     reinforced_count,
                     created_at,
                     last_reinforced_at,
-                    x: r.get(12)?,
-                    y: r.get(13)?,
-                    has_embedding: r.get::<_, i64>(14)? != 0,
+                    x: r.get(15)?,
+                    y: r.get(16)?,
+                    has_embedding: r.get::<_, i64>(17)? != 0,
                 })
             })?;
             let beliefs = rows.collect::<Result<Vec<_>, _>>()?;

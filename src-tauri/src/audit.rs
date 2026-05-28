@@ -106,6 +106,7 @@ impl AuditDb {
         })
     }
 
+    #[allow(dead_code)] // Used by integration tests in other modules.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
@@ -343,6 +344,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 /// Best-effort wrapper for callers that don't want a failed audit-log to
 /// fail their main-DB op. Returns the `AuditEntry` on success or a
 /// `tracing`-style error logged via `eprintln!` on failure.
+#[allow(dead_code)] // First caller lands when ledger/merge writes get wired through audit.
 #[inline]
 pub fn log_best_effort(
     audit: &AuditDb,

@@ -526,7 +526,11 @@ fn list_beliefs_sql(
                 bv.statement, bv.confidence,
                 (SELECT COUNT(*) FROM belief_provenance bp
                   JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
-                  WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count
+                  WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count,
+                (SELECT COUNT(*) FROM belief_provenance bp
+                  JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
+                  WHERE bv2.belief_id = b.id AND bp.relation = 'contradicted_by') AS contradicted_count,
+                b.num_times, b.last_observed_at
          FROM beliefs b
          LEFT JOIN belief_versions bv ON bv.id = b.current_version_id
          WHERE 1=1",
@@ -551,16 +555,24 @@ fn list_beliefs_sql(
     let param_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |r| {
         let trust_class: String = r.get(5)?;
+        let status: String = r.get(4)?;
         let created_at: String = r.get(10)?;
         let last_reinforced_at: Option<String> = r.get(12)?;
         let stored: Option<f64> = r.get(14)?;
         let reinforced_count: i64 = r.get(15)?;
+        let contradicted_count: i64 = r.get(16)?;
+        let num_times: i64 = r.get(17)?;
+        let last_observed_at: Option<String> = r.get(18)?;
         // Structural confidence — never self-reported. See confidence.rs.
         let eff = crate::confidence::effective_for(
             &trust_class,
             reinforced_count,
+            contradicted_count,
+            num_times,
+            status == "corrected",
             &created_at,
             last_reinforced_at.as_deref(),
+            last_observed_at.as_deref(),
             stored,
         );
         Ok(json!({
@@ -568,7 +580,7 @@ fn list_beliefs_sql(
             "subject": r.get::<_, String>(1)?,
             "category": r.get::<_, Option<String>>(2)?,
             "current_version_id": r.get::<_, Option<String>>(3)?,
-            "status": r.get::<_, String>(4)?,
+            "status": status,
             "trust_class": trust_class,
             "scope": r.get::<_, String>(6)?,
             "scope_ref_id": r.get::<_, Option<String>>(7)?,
@@ -578,6 +590,8 @@ fn list_beliefs_sql(
             "updated_at": r.get::<_, String>(11)?,
             "last_reinforced_at": last_reinforced_at,
             "reinforced_count": reinforced_count,
+            "contradicted_count": contradicted_count,
+            "num_times": num_times,
             "statement": r.get::<_, Option<String>>(13)?,
             "confidence": eff.score,
             "confidence_bucket": eff.bucket.as_str(),

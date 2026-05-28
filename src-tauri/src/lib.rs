@@ -498,18 +498,34 @@ async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> 
 
 // ---------- structural confidence ----------
 
-/// Build a belief's read-time effective confidence (structural score + coarse
-/// bucket) from its row primitives. This is the ONLY path a confidence value
-/// reaches the UI — the model never supplies one. `stored` is NULL for leaves
-/// and the Rust-computed aggregate for summaries. Delegates to `confidence`.
+/// Build a belief's read-time effective confidence (Beta-posterior score
+/// + coarse bucket) from its row primitives. This is the ONLY path a
+/// confidence value reaches the UI — the model never supplies one.
+/// `stored` is NULL for leaves and the Rust-computed aggregate for
+/// summaries. Delegates to [`confidence::effective_for`].
+#[allow(clippy::too_many_arguments)]
 fn effective_conf(
     trust_class: &str,
     reinforced_count: i64,
+    contradicted_count: i64,
+    num_times: i64,
+    is_corrected: bool,
     created_at: &str,
     last_reinforced_at: Option<&str>,
+    last_observed_at: Option<&str>,
     stored: Option<f64>,
 ) -> confidence::EffectiveConfidence {
-    confidence::effective_for(trust_class, reinforced_count, created_at, last_reinforced_at, stored)
+    confidence::effective_for(
+        trust_class,
+        reinforced_count,
+        contradicted_count,
+        num_times,
+        is_corrected,
+        created_at,
+        last_reinforced_at,
+        last_observed_at,
+        stored,
+    )
 }
 
 // ---------- audit (Belief Ledger) ----------
@@ -569,22 +585,30 @@ pub struct BeliefDetail {
 }
 
 /// Map an audit row to an `AuditBelief`, computing structural confidence.
-/// Both the list and detail queries select the same 14 columns in this order:
-/// id, statement, confidence, category, status, trust_class, level,
-/// parent_summary_id, prov_count, ver_count, reinforced_count, created_at,
-/// updated_at, last_reinforced_at.
+/// Column order: id, statement, confidence, category, status, trust_class,
+/// level, parent_summary_id, prov_count, ver_count, reinforced_count,
+/// contradicted_count, num_times, created_at, updated_at, last_reinforced_at,
+/// last_observed_at.
 fn row_to_audit_belief(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditBelief> {
     let trust_class: String = r.get(5)?;
+    let status: String = r.get(4)?;
     let stored: Option<f64> = r.get(2)?;
     let reinforced_count: i64 = r.get(10)?;
-    let created_at: String = r.get(11)?;
-    let updated_at: String = r.get(12)?;
-    let last_reinforced_at: Option<String> = r.get(13)?;
+    let contradicted_count: i64 = r.get(11)?;
+    let num_times: i64 = r.get(12)?;
+    let created_at: String = r.get(13)?;
+    let updated_at: String = r.get(14)?;
+    let last_reinforced_at: Option<String> = r.get(15)?;
+    let last_observed_at: Option<String> = r.get(16)?;
     let eff = effective_conf(
         &trust_class,
         reinforced_count,
+        contradicted_count,
+        num_times,
+        status == "corrected",
         &created_at,
         last_reinforced_at.as_deref(),
+        last_observed_at.as_deref(),
         stored,
     );
     Ok(AuditBelief {
@@ -593,7 +617,7 @@ fn row_to_audit_belief(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditBelief> {
         effective_confidence: eff.score,
         confidence_bucket: eff.bucket.as_str().to_string(),
         category: r.get(3)?,
-        status: r.get(4)?,
+        status,
         trust_class,
         level: r.get(6)?,
         parent_summary_id: r.get(7)?,
@@ -620,12 +644,17 @@ fn list_beliefs_audit(state: State<'_, AppState>) -> Result<Vec<AuditBelief>, St
                           JOIN belief_versions bv2 ON bv2.id = bp2.belief_version_id
                           WHERE bv2.belief_id = b.id
                             AND bp2.relation = 'reinforced_by') AS reinforced_count,
-                        b.created_at, b.updated_at, b.last_reinforced_at
+                        (SELECT COUNT(*) FROM belief_provenance bp3
+                          JOIN belief_versions bv3 ON bv3.id = bp3.belief_version_id
+                          WHERE bv3.belief_id = b.id
+                            AND bp3.relation = 'contradicted_by') AS contradicted_count,
+                        b.num_times,
+                        b.created_at, b.updated_at, b.last_reinforced_at, b.last_observed_at
                  FROM beliefs b
                  JOIN belief_versions bv ON bv.id = b.current_version_id
                  ORDER BY b.updated_at DESC",
             )?;
-            let rows = stmt.query_map([], |r| Ok(row_to_audit_belief(r)?))?;
+            let rows = stmt.query_map([], |r| row_to_audit_belief(r))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .map_err(|e| e.to_string())
@@ -1007,7 +1036,11 @@ pub(crate) async fn run_generate_recap(
                         (SELECT COUNT(*) FROM belief_provenance bp
                           JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
                           WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by') AS reinforced_count,
-                        b.created_at, b.last_reinforced_at, bv.confidence
+                        (SELECT COUNT(*) FROM belief_provenance bp2
+                          JOIN belief_versions bv3 ON bv3.id = bp2.belief_version_id
+                          WHERE bv3.belief_id = b.id AND bp2.relation = 'contradicted_by') AS contradicted_count,
+                        b.num_times,
+                        b.created_at, b.last_reinforced_at, b.last_observed_at, bv.confidence
                  FROM beliefs b
                  JOIN belief_versions bv ON bv.id = b.current_version_id
                  WHERE substr(b.created_at, 1, 10) = ?1
@@ -1022,14 +1055,21 @@ pub(crate) async fn run_generate_recap(
                     let trust_class: String = r.get(2)?;
                     let status: String = r.get(3)?;
                     let reinforced_count: i64 = r.get(4)?;
-                    let created_at: String = r.get(5)?;
-                    let last_reinforced_at: Option<String> = r.get(6)?;
-                    let stored: Option<f64> = r.get(7)?;
+                    let contradicted_count: i64 = r.get(5)?;
+                    let num_times: i64 = r.get(6)?;
+                    let created_at: String = r.get(7)?;
+                    let last_reinforced_at: Option<String> = r.get(8)?;
+                    let last_observed_at: Option<String> = r.get(9)?;
+                    let stored: Option<f64> = r.get(10)?;
                     let eff = effective_conf(
                         &trust_class,
                         reinforced_count,
+                        contradicted_count,
+                        num_times,
+                        status == "corrected",
                         &created_at,
                         last_reinforced_at.as_deref(),
+                        last_observed_at.as_deref(),
                         stored,
                     );
                     Ok(recap::BeliefRow {
@@ -1296,24 +1336,45 @@ pub(crate) async fn run_summarize_pass(
                 let mut score_sum = 0.0f64;
                 let mut scored = 0u32;
                 for child_id in &valid_children {
-                    if let Ok((tc, rc, created, last_reinf)) = tx.query_row(
-                        "SELECT b.trust_class,
-                                (SELECT COUNT(*) FROM belief_provenance bp
-                                 JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
-                                 WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by'),
-                                b.created_at, b.last_reinforced_at
-                         FROM beliefs b WHERE b.id = ?1",
-                        params![child_id],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, i64>(1)?,
-                                r.get::<_, String>(2)?,
-                                r.get::<_, Option<String>>(3)?,
-                            ))
-                        },
-                    ) {
-                        score_sum += effective_conf(&tc, rc, &created, last_reinf.as_deref(), None).score;
+                    if let Ok((tc, st, rc, cc, nt, created, last_reinf, last_obs)) = tx
+                        .query_row(
+                            "SELECT b.trust_class, b.status,
+                                    (SELECT COUNT(*) FROM belief_provenance bp
+                                     JOIN belief_versions bv2 ON bv2.id = bp.belief_version_id
+                                     WHERE bv2.belief_id = b.id AND bp.relation = 'reinforced_by'),
+                                    (SELECT COUNT(*) FROM belief_provenance bp2
+                                     JOIN belief_versions bv3 ON bv3.id = bp2.belief_version_id
+                                     WHERE bv3.belief_id = b.id AND bp2.relation = 'contradicted_by'),
+                                    b.num_times,
+                                    b.created_at, b.last_reinforced_at, b.last_observed_at
+                             FROM beliefs b WHERE b.id = ?1",
+                            params![child_id],
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, i64>(2)?,
+                                    r.get::<_, i64>(3)?,
+                                    r.get::<_, i64>(4)?,
+                                    r.get::<_, String>(5)?,
+                                    r.get::<_, Option<String>>(6)?,
+                                    r.get::<_, Option<String>>(7)?,
+                                ))
+                            },
+                        )
+                    {
+                        score_sum += effective_conf(
+                            &tc,
+                            rc,
+                            cc,
+                            nt,
+                            st == "corrected",
+                            &created,
+                            last_reinf.as_deref(),
+                            last_obs.as_deref(),
+                            None,
+                        )
+                        .score;
                         scored += 1;
                     }
                 }
