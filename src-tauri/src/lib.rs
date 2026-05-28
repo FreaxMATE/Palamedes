@@ -1533,9 +1533,15 @@ async fn mcp_start(state: State<'_, AppState>) -> Result<McpStatus, String> {
             t
         }
     };
-    let handle = mcp::server::start(state.db.clone(), state.client.clone(), port, token.clone())
-        .await
-        .map_err(|e| format!("mcp_start failed: {e}"))?;
+    let handle = mcp::server::start(
+        state.db.clone(),
+        state.client.clone(),
+        state.audit.clone(),
+        port,
+        token.clone(),
+    )
+    .await
+    .map_err(|e| format!("mcp_start failed: {e}"))?;
     state
         .db
         .set_setting("mcp_server_enabled", "true")
@@ -1825,11 +1831,7 @@ pub async fn headless_mcp_serve(data_dir: std::path::PathBuf) -> anyhow::Result<
     let db_path = data_dir.join("palamedes.db");
     let db = Arc::new(Db::open(&db_path)?);
     let audit_path = data_dir.join("audit.db");
-    let _audit = Arc::new(audit::AuditDb::open(&audit_path)?);
-    // _audit is held but not yet threaded into the headless MCP server.
-    // The MCP handlers don't see AppState in this mode; once we add an
-    // audit-aware constructor for PalamedesMcpHandler (week-2 follow-up),
-    // this binding becomes active.
+    let chain = Arc::new(audit::AuditDb::open(&audit_path)?);
     let client = NebiusClient::from_env()?;
     let port: u16 = db
         .get_setting("mcp_server_port")?
@@ -1845,7 +1847,7 @@ pub async fn headless_mcp_serve(data_dir: std::path::PathBuf) -> anyhow::Result<
         }
     };
     db.set_setting("mcp_server_enabled", "true")?;
-    mcp::server::start(db, client, port, token).await
+    mcp::server::start(db, client, chain, port, token).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1881,6 +1883,7 @@ pub fn run() {
             let recap_data_dir = data_dir.clone();
             let mcp_client = client.clone();
             let mcp_db = db.clone();
+            let mcp_chain = audit.clone();
             let mcp_handle = app.handle().clone();
 
             app.manage(AppState {
@@ -1948,7 +1951,7 @@ pub fn run() {
                     }
                 };
                 log::info!("mcp auto-start: binding on 127.0.0.1:{}", port);
-                match mcp::server::start(mcp_db, mcp_client, port, token).await {
+                match mcp::server::start(mcp_db, mcp_client, mcp_chain, port, token).await {
                     Ok(handle) => {
                         log::info!("mcp server listening at {}", handle.url());
                         let state = mcp_handle.state::<AppState>();

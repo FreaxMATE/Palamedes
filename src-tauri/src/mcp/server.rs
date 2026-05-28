@@ -23,6 +23,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::audit::AuditDb;
 use crate::db::Db;
 use crate::mcp::handlers::PalamedesMcpHandler;
 use crate::nebius::NebiusClient;
@@ -55,20 +56,23 @@ impl McpServerHandle {
 pub async fn start(
     db: Arc<Db>,
     client: NebiusClient,
+    chain: Arc<AuditDb>,
     port: u16,
     token: String,
 ) -> anyhow::Result<McpServerHandle> {
     let cancel = CancellationToken::new();
 
-    // Factory: one handler per session. Db (Arc) and NebiusClient are
-    // cheap to clone — they share state. The handler's own client_id
+    // Factory: one handler per session. Db/AuditDb (Arc) and NebiusClient
+    // are cheap to clone — they share state. The handler's own client_id
     // RwLock is fresh per session.
     let db_factory = db.clone();
     let client_factory = client.clone();
+    let chain_factory = chain.clone();
     let factory = move || {
         Ok(PalamedesMcpHandler::new(
             db_factory.clone(),
             client_factory.clone(),
+            chain_factory.clone(),
         ))
     };
 
@@ -162,9 +166,10 @@ mod tests {
             .join(format!("palamedes-mcp-test-{}.db", uuid::Uuid::new_v4()));
         let db = Arc::new(Db::open(&path).unwrap());
         let client = NebiusClient::from_api_key("test-key".into());
+        let chain = Arc::new(AuditDb::open_in_memory().unwrap());
         let token = "test-bearer-token-1234".to_string();
 
-        let handle = start(db, client, 0, token.clone()).await.unwrap();
+        let handle = start(db, client, chain, 0, token.clone()).await.unwrap();
         let url = handle.url();
 
         let http = reqwest::Client::new();

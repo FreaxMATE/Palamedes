@@ -207,6 +207,43 @@ impl AuditDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Filtered slice of the chain. `belief_id_like` does a substring
+    /// match on the metadata JSON — sufficient because every write that
+    /// names a belief includes the literal UUID in its metadata blob.
+    /// `since` and `until` are RFC-3339 timestamps; either may be None.
+    pub fn query(
+        &self,
+        belief_id_like: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AuditEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT seq, ts, operation, actor, content_hash, prev_hash, event_hash, metadata
+             FROM audit_chain WHERE 1=1",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(b) = belief_id_like {
+            sql.push_str(" AND metadata LIKE ?");
+            binds.push(Box::new(format!("%{b}%")));
+        }
+        if let Some(s) = since {
+            sql.push_str(" AND ts >= ?");
+            binds.push(Box::new(s.to_string()));
+        }
+        if let Some(u) = until {
+            sql.push_str(" AND ts <= ?");
+            binds.push(Box::new(u.to_string()));
+        }
+        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        binds.push(Box::new(limit));
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), row_to_entry)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Walk the chain top-to-bottom and re-derive every hash. Returns OK
     /// when every row is consistent with its predecessor, otherwise the
     /// first failing seq + a short explanation.
