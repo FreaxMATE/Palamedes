@@ -9,6 +9,7 @@
     saveBeliefPositions,
     getBeliefDetail,
     regenerateBeliefLabels,
+    nameCluster,
     type GraphBelief,
     type GraphEdge,
     type GraphEdgeKind,
@@ -127,58 +128,60 @@
     danger: string;
   };
 
+  // Civic Archive — graphite + vermilion chop seal + ochre for contradictions.
+  // No gradients (flat dark surface). Edges that contradict get ochre, not red.
   const DARK: Palette = {
-    bgGradTop: "#16171a", bgGradBot: "#0a0a0c",
-    ink: "#cfd2d8",
-    inkSoft: "rgba(207,210,216,0.60)",
-    inkFaint: "rgba(207,210,216,0.35)",
-    gridMinor: "rgba(207,210,216,0.06)",
-    gridMajor: "rgba(207,210,216,0.13)",
-    ticks: "rgba(207,210,216,0.40)",
-    regionRing: "rgba(207,210,216,0.07)",
-    connection: "rgba(207,210,216,0.04)",
-    crosshair: "rgba(255,181,71,0.18)",
-    asserted: "#d8e0e8",
-    inferred: "#7da4c4",
-    hypothesized: "#8a8d96",
-    summary: "#ffb547",
-    summaryCore: "#0a0a0c",
-    accent: "#ffb547",
-    edgeHierarchy: "rgba(207,210,216,0.45)",
-    edgeSummarizes: "rgba(255,181,71,0.55)",
-    edgeReinforced: "rgba(207,210,216,0.55)",
-    edgeContradicted: "rgba(255,90,90,0.70)",
-    edgeCorrected: "rgba(255,150,90,0.65)",
-    edgeKnn: "rgba(125,164,196,0.18)",
-    edgeCoRecall: "rgba(255,181,71,0.18)",
-    danger: "#ff5a5a",
+    bgGradTop: "#1E1F23", bgGradBot: "#1E1F23",     // flat graphite
+    ink: "#E8E2D6",                                   // warm bone
+    inkSoft: "rgba(232,226,214,0.62)",
+    inkFaint: "rgba(232,226,214,0.35)",
+    gridMinor: "rgba(232,226,214,0.05)",              // drafting paper, very faint
+    gridMajor: "rgba(232,226,214,0.10)",
+    ticks: "rgba(232,226,214,0.40)",
+    regionRing: "rgba(232,226,214,0.12)",             // cluster contour ring base
+    connection: "rgba(232,226,214,0.04)",
+    crosshair: "rgba(209,79,63,0.18)",                // vermilion
+    asserted: "#E8E2D6",                              // solid warm bone
+    inferred: "rgba(232,226,214,0.55)",               // half-fill ghost
+    hypothesized: "#88847b",                          // dim ring only
+    summary: "#D14F3F",                               // vermilion chop seal
+    summaryCore: "#1E1F23",                           // canvas color for inner cut-out
+    accent: "#D14F3F",                                // vermilion
+    edgeHierarchy: "rgba(232,226,214,0.30)",
+    edgeSummarizes: "rgba(209,79,63,0.55)",           // vermilion ridge
+    edgeReinforced: "rgba(232,226,214,0.45)",
+    edgeContradicted: "rgba(184,146,74,0.85)",        // ochre fault line (the warn token)
+    edgeCorrected: "rgba(184,146,74,0.65)",
+    edgeKnn: "rgba(232,226,214,0.08)",
+    edgeCoRecall: "rgba(209,79,63,0.12)",
+    danger: "#D14F3F",
   };
 
   const LIGHT: Palette = {
-    bgGradTop: "#f4f3ee", bgGradBot: "#e9e6dc",
-    ink: "#2a2a2e",
-    inkSoft: "rgba(42,42,46,0.62)",
-    inkFaint: "rgba(42,42,46,0.40)",
-    gridMinor: "rgba(42,42,46,0.07)",
-    gridMajor: "rgba(42,42,46,0.16)",
-    ticks: "rgba(42,42,46,0.45)",
-    regionRing: "rgba(42,42,46,0.09)",
-    connection: "rgba(42,42,46,0.06)",
-    crosshair: "rgba(178,82,28,0.30)",
-    asserted: "#1f2024",
-    inferred: "#2f5d8a",
-    hypothesized: "#7c7a72",
-    summary: "#b2521c",
-    summaryCore: "#f4f3ee",
-    accent: "#b2521c",
-    edgeHierarchy: "rgba(42,42,46,0.55)",
-    edgeSummarizes: "rgba(178,82,28,0.65)",
-    edgeReinforced: "rgba(42,42,46,0.55)",
-    edgeContradicted: "rgba(180,40,40,0.75)",
-    edgeCorrected: "rgba(200,90,40,0.70)",
-    edgeKnn: "rgba(47,93,138,0.22)",
-    edgeCoRecall: "rgba(178,82,28,0.22)",
-    danger: "#b42828",
+    bgGradTop: "#F7F3EC", bgGradBot: "#F7F3EC",      // warm paper, flat
+    ink: "#1B1B1F",                                    // deep ink
+    inkSoft: "rgba(27,27,31,0.62)",
+    inkFaint: "rgba(27,27,31,0.40)",
+    gridMinor: "rgba(27,27,31,0.05)",
+    gridMajor: "rgba(27,27,31,0.10)",
+    ticks: "rgba(27,27,31,0.45)",
+    regionRing: "rgba(27,27,31,0.12)",
+    connection: "rgba(27,27,31,0.06)",
+    crosshair: "rgba(209,79,63,0.30)",
+    asserted: "#1B1B1F",
+    inferred: "rgba(27,27,31,0.55)",
+    hypothesized: "#6e6a60",
+    summary: "#D14F3F",
+    summaryCore: "#F7F3EC",
+    accent: "#D14F3F",
+    edgeHierarchy: "rgba(27,27,31,0.45)",
+    edgeSummarizes: "rgba(209,79,63,0.60)",
+    edgeReinforced: "rgba(27,27,31,0.50)",
+    edgeContradicted: "rgba(184,146,74,0.85)",
+    edgeCorrected: "rgba(184,146,74,0.65)",
+    edgeKnn: "rgba(27,27,31,0.10)",
+    edgeCoRecall: "rgba(209,79,63,0.15)",
+    danger: "#D14F3F",
   };
 
   let palette = $derived(themeState.current === "light" ? LIGHT : DARK);
@@ -193,12 +196,182 @@
     other: 60,
   };
 
-  function categoryTint(cat: string | null): string | null {
-    if (!cat || !(cat in CATEGORY_HUE)) return null;
-    const h = CATEGORY_HUE[cat];
-    return themeState.current === "light"
-      ? `hsl(${h}, 45%, 38%)`
-      : `hsl(${h}, 50%, 65%)`;
+  // Civic Archive: nodes are monochrome — bone for asserted, half-fill for inferred,
+  // hairline ring for hypothesized, vermilion for summaries. No category hue tinting.
+  // (CATEGORY_HUE kept above for the legend's optional category panel, but tint
+  // is suppressed on the canvas.)
+  function categoryTint(_cat: string | null): string | null {
+    return null;
+  }
+
+  // ============================================================
+  // Clustering — k-means on 2D positions, auto-K via silhouette.
+  // Drives the Survey-map contour regions. Cheap (n ≤ a few hundred);
+  // re-runs whenever the projection version changes.
+  // ============================================================
+
+  type Cluster = {
+    id: number;
+    cx: number; cy: number;     // centroid (world coords)
+    sx: number; sy: number;     // std-dev along each axis (world coords)
+    meanConfidence: number;
+    members: GraphBelief[];
+  };
+  let clusters: Cluster[] = $state([]);
+  /** projection_version this cluster set was computed for. */
+  let clustersForVersion = $state<number | null>(null);
+  /** LLM-generated cluster names, keyed by cluster id (resets each re-cluster). */
+  let clusterLabels = $state<Map<number, string>>(new Map());
+  let clusterLabelingVersion = -1;
+
+  function _distSq(ax: number, ay: number, bx: number, by: number): number {
+    const dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
+  }
+
+  /** k-means++ init + Lloyd iteration. Deterministic-ish (seeded by point order). */
+  function kmeans2D(pts: { x: number; y: number }[], k: number, iters = 30): number[] {
+    const n = pts.length;
+    if (n === 0 || k <= 0) return [];
+    if (k === 1) return new Array(n).fill(0);
+    const cents: [number, number][] = [];
+    // k-means++ seeding
+    cents.push([pts[0].x, pts[0].y]);
+    for (let c = 1; c < k; c++) {
+      const dists = pts.map((p) => {
+        let m = Infinity;
+        for (const ct of cents) {
+          const d = _distSq(p.x, p.y, ct[0], ct[1]);
+          if (d < m) m = d;
+        }
+        return m;
+      });
+      const total = dists.reduce((a, b) => a + b, 0);
+      let r = Math.random() * total;
+      let picked = pts.length - 1;
+      for (let i = 0; i < n; i++) {
+        r -= dists[i];
+        if (r <= 0) { picked = i; break; }
+      }
+      cents.push([pts[picked].x, pts[picked].y]);
+    }
+    const assign = new Array<number>(n).fill(0);
+    for (let it = 0; it < iters; it++) {
+      let changed = false;
+      for (let i = 0; i < n; i++) {
+        let best = 0, bestD = Infinity;
+        for (let c = 0; c < k; c++) {
+          const d = _distSq(pts[i].x, pts[i].y, cents[c][0], cents[c][1]);
+          if (d < bestD) { bestD = d; best = c; }
+        }
+        if (assign[i] !== best) { assign[i] = best; changed = true; }
+      }
+      if (!changed) break;
+      const sums: [number, number, number][] = Array.from({ length: k }, () => [0, 0, 0]);
+      for (let i = 0; i < n; i++) {
+        const c = assign[i];
+        sums[c][0] += pts[i].x;
+        sums[c][1] += pts[i].y;
+        sums[c][2] += 1;
+      }
+      for (let c = 0; c < k; c++) {
+        if (sums[c][2] > 0) cents[c] = [sums[c][0] / sums[c][2], sums[c][1] / sums[c][2]];
+      }
+    }
+    return assign;
+  }
+
+  /** Silhouette score — mean over points; range [-1, 1], higher is better. */
+  function silhouette(pts: { x: number; y: number }[], assign: number[], k: number): number {
+    const n = pts.length;
+    if (k <= 1 || k >= n) return -1;
+    const groups: number[][] = Array.from({ length: k }, () => []);
+    assign.forEach((c, i) => groups[c].push(i));
+    let total = 0, count = 0;
+    for (let i = 0; i < n; i++) {
+      const own = assign[i];
+      if (groups[own].length <= 1) continue;
+      let a = 0;
+      for (const j of groups[own]) if (j !== i)
+        a += Math.sqrt(_distSq(pts[i].x, pts[i].y, pts[j].x, pts[j].y));
+      a /= (groups[own].length - 1);
+      let b = Infinity;
+      for (let c = 0; c < k; c++) {
+        if (c === own || groups[c].length === 0) continue;
+        let m = 0;
+        for (const j of groups[c])
+          m += Math.sqrt(_distSq(pts[i].x, pts[i].y, pts[j].x, pts[j].y));
+        m /= groups[c].length;
+        if (m < b) b = m;
+      }
+      if (!Number.isFinite(b)) continue;
+      const s = (b - a) / Math.max(a, b);
+      total += s;
+      count += 1;
+    }
+    return count > 0 ? total / count : 0;
+  }
+
+  function recomputeClusters() {
+    // Skip if we've already clustered this projection version.
+    if (clustersForVersion === projectionVersion && clusters.length > 0) return;
+    // Only beliefs with a 2D position and an embedding participate.
+    // Summaries are excluded — they're meta-beliefs, not topical members.
+    const candidates = beliefs.filter(
+      (b) => b.x !== null && b.y !== null && b.has_embedding && b.trust_class !== "summary",
+    );
+    if (candidates.length < 4) {
+      clusters = [];
+      clustersForVersion = projectionVersion;
+      return;
+    }
+    const pts = candidates.map((b) => ({ x: b.x as number, y: b.y as number }));
+    // Auto-K: try 2..min(7, sqrt(n/2)); pick best silhouette.
+    const maxK = Math.max(2, Math.min(7, Math.floor(Math.sqrt(candidates.length / 2))));
+    let bestK = 2, bestScore = -Infinity, bestAssign: number[] = [];
+    for (let k = 2; k <= maxK; k++) {
+      const assign = kmeans2D(pts, k);
+      const score = silhouette(pts, assign, k);
+      if (score > bestScore) { bestScore = score; bestK = k; bestAssign = assign; }
+    }
+    const groups: Cluster[] = Array.from({ length: bestK }, (_, i) => ({
+      id: i, cx: 0, cy: 0, sx: 0, sy: 0, members: [], meanConfidence: 0,
+    }));
+    for (let i = 0; i < candidates.length; i++) groups[bestAssign[i]].members.push(candidates[i]);
+    for (const c of groups) {
+      if (c.members.length === 0) continue;
+      c.cx = c.members.reduce((a, m) => a + (m.x as number), 0) / c.members.length;
+      c.cy = c.members.reduce((a, m) => a + (m.y as number), 0) / c.members.length;
+      c.sx = Math.sqrt(
+        c.members.reduce((a, m) => a + ((m.x as number) - c.cx) ** 2, 0) / c.members.length,
+      ) || 0.05;
+      c.sy = Math.sqrt(
+        c.members.reduce((a, m) => a + ((m.y as number) - c.cy) ** 2, 0) / c.members.length,
+      ) || 0.05;
+      c.meanConfidence =
+        c.members.reduce((a, m) => a + m.confidence, 0) / c.members.length;
+    }
+    clusters = groups.filter((c) => c.members.length >= 2);
+    clustersForVersion = projectionVersion;
+    // Fire-and-forget LLM cluster naming, cached per projection_version.
+    nameClustersAsync();
+  }
+
+  async function nameClustersAsync() {
+    if (clusterLabelingVersion === projectionVersion) return;
+    clusterLabelingVersion = projectionVersion;
+    const snapshot = clusters.map((c) => ({ id: c.id, statements: c.members.slice(0, 6).map((m) => m.statement) }));
+    for (const c of snapshot) {
+      try {
+        const label = await nameCluster(c.statements);
+        // Only set if this cluster set is still current (no later projection swooped in).
+        if (clusterLabelingVersion === projectionVersion) {
+          clusterLabels = new Map(clusterLabels).set(c.id, label);
+        }
+      } catch {
+        // Network/LLM hiccup — leave unlabeled; legend falls back to "Region N".
+      }
+    }
   }
 
   function withAlpha(hex: string, a: number): string {
@@ -301,6 +474,7 @@
     } else {
       status = `${beliefs.length} beliefs · ${edges.length} edges · v${projectionVersion}`;
     }
+    recomputeClusters();
     fitAndRender();
   }
 
@@ -342,6 +516,7 @@
       beliefs = snap.beliefs;
       edges = snap.edges;
       status = `${beliefs.length} beliefs · ${edges.length} edges · v${newVersion}`;
+      recomputeClusters();
     } catch (e) {
       status = `projection failed: ${e}`;
     } finally {
@@ -627,6 +802,67 @@
     upper.pop();
     lower.pop();
     return lower.concat(upper);
+  }
+
+  /** Project a static world-space point to screen — no per-id breathing.
+   *  Used for contour centers/sizes so the rings don't wobble. */
+  function projectStatic(wx: number, wy: number, w: number, h: number): [number, number] {
+    const bs = baseScale(w, h) * viewport.scale;
+    const px = w / 2 + (wx * bs) + viewport.offsetX * dpr * viewport.scale;
+    const py = h / 2 + (wy * bs) + viewport.offsetY * dpr * viewport.scale;
+    return [px, py];
+  }
+
+  /** Survey-style concentric contours per cluster. Ring count scales with
+   *  mean confidence (1..5). Rings are drawn around the cluster centroid,
+   *  sized by std-dev along each axis. */
+  function drawClusterContours(
+    ctx: CanvasRenderingContext2D,
+    w: number, h: number,
+  ) {
+    if (clusters.length === 0) return;
+    const P = palette;
+    const bs = baseScale(w, h) * viewport.scale;
+    ctx.save();
+    for (const c of clusters) {
+      if (c.members.length < 2) continue;
+      const [cx, cy] = projectStatic(c.cx, c.cy, w, h);
+      const rx = Math.max(20 * dpr, Math.abs(c.sx) * bs);
+      const ry = Math.max(20 * dpr, Math.abs(c.sy) * bs);
+      const rings = Math.max(2, Math.min(5, 1 + Math.floor(c.meanConfidence * 4)));
+      for (let i = 0; i < rings; i++) {
+        const scale = 1.4 + i * 0.55;
+        const a = 0.42 - i * 0.06;  // outer rings fade out
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx * scale, ry * scale, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(P.regionRing, Math.max(0.06, a));
+        ctx.lineWidth = (i === 0 ? 0.9 : 0.6) * dpr;
+        ctx.stroke();
+      }
+      // Tiny vermilion peak dot at the centroid — visual chop seal for the region.
+      ctx.beginPath();
+      ctx.arc(cx, cy, 1.4 * dpr, 0, Math.PI * 2);
+      ctx.fillStyle = withAlpha(P.accent, 0.55);
+      ctx.fill();
+      // Region label (uppercase tracked) above the centroid.
+      const label = clusterLabels.get(c.id) ?? `Region ${c.id + 1}`;
+      const upper = label.toUpperCase();
+      ctx.font = `600 ${9 * dpr}px "IBM Plex Sans", system-ui, sans-serif`;
+      ctx.fillStyle = withAlpha(P.ink, 0.65);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "alphabetic";
+      // Manual letter-spacing for the tracked-uppercase look.
+      const spaced = upper.split("").join(" "); // thin space
+      ctx.fillText(spaced, cx, cy - ry * 1.4 - 14 * dpr);
+      // Member count + elevation, tiny mono caption beneath the label.
+      ctx.font = `400 ${8 * dpr}px "IBM Plex Mono", monospace`;
+      ctx.fillStyle = withAlpha(P.ink, 0.40);
+      ctx.fillText(
+        `${c.members.length} atoms · elev. ${c.meanConfidence.toFixed(2)}`,
+        cx, cy - ry * 1.4 - 4 * dpr,
+      );
+    }
+    ctx.restore();
   }
 
   function drawSummaryHulls(
@@ -1137,7 +1373,8 @@
     const leaves = visAll.filter((b) => b.trust_class !== "summary");
     const summaries = visAll.filter((b) => b.trust_class === "summary");
 
-    drawSummaryHulls(ctx, w, h, t, visAll);
+    // Survey-style cluster contours replace the old summary hulls.
+    drawClusterContours(ctx, w, h);
     drawEdges(ctx, w, h, t, visAll);
 
     const pts: ScreenPoint[] = [];
@@ -1472,7 +1709,7 @@
       <button onclick={onClose} class="opacity-60 hover:opacity-100 text-base leading-none" aria-label="Close">×</button>
 
       {#if advancedOpen}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
         <div
           class="absolute right-0 top-full mt-2 z-30 w-72 rounded-md shadow-lg p-3 text-[11px] space-y-3"
           style="background: var(--pal-surface); border: 1px solid var(--pal-border); color: var(--pal-ink);"
@@ -1674,7 +1911,7 @@
                    font-size: 9px;
                    color: {themeState.current === 'light' ? 'rgba(42,42,46,0.50)' : 'rgba(232,220,203,0.45)'};"
           >
-            <span>conf {Math.round(hoverBelief.confidence * 100)}%</span>
+            <span>{hoverBelief.confidence_bucket}</span>
             {#if hoverBelief.reinforced_count > 0}
               <span>×{hoverBelief.reinforced_count} reinforced</span>
             {/if}
@@ -1804,7 +2041,7 @@
                  color: {themeState.current === 'light' ? 'rgba(42,42,46,0.55)' : 'rgba(207,210,216,0.55)'};"
         >
           {selected.belief.trust_class} · {selected.belief.status}{#if selected.belief.category} · {selected.belief.category}{/if}
-          · conf {selected.belief.confidence.toFixed(2)}
+          · {selected.belief.confidence_bucket}
         </p>
 
         <!-- Receipts spotlight (Phase C) -->
@@ -1865,7 +2102,6 @@
                        color: {themeState.current === 'light' ? 'rgba(42,42,46,0.55)' : 'rgba(207,210,216,0.55)'};"
               >
                 <span>v{v.version_num} · {v.editor}</span>
-                <span>{v.confidence.toFixed(2)}</span>
               </div>
               <p class="mt-0.5">{v.statement}</p>
               {#if v.reason}
