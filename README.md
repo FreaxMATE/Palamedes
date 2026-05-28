@@ -56,6 +56,40 @@ status, trust_class, version, provenance[] }` — is published as the **Belief
 Schema for MCP** ([docs/BELIEF_SCHEMA_MCP.md](docs/BELIEF_SCHEMA_MCP.md),
 CC-BY-SA-4.0). Palamedes is the reference implementation. Fork it.
 
+## Known limitations
+
+Audit-grade isn't a finished state — it's a thing you can verify, including
+verifying what *isn't* yet covered. The honest list:
+
+- **MCP consent is bucket-level today.** Granting a client read access lets
+  it call every read tool; a per-category ACL (e.g. "preferences but not
+  personal") is on the week-4 roadmap. A per-client 1000-reads/24h rate limit
+  plus a full audit log of every read are already in place; you can see
+  exactly what each connected AI has fetched.
+- **Embedding-model swaps require a re-embed pass.** If you change the
+  embedding model, Palamedes detects it at startup, archives the old vectors
+  to `vec_beliefs_legacy_<dim>` so you can roll back, and shows a banner. The
+  background loop refills `vec_beliefs` at the new dim — semantic search
+  degrades to empty until that completes.
+- **The UMAP memory map runs client-side.** Fine up to roughly 10k beliefs;
+  past that, the initial render gets sluggish. Worker-side projection and
+  delta sync are on the week-5 roadmap.
+- **Extended graph edges (kNN, co-recall) are recomputed on every map open.**
+  The composite index added in week 1 makes this cheap up to ~50k receipts;
+  full materialization lands in week 2.
+- **Confidence is recomputed on every fetch.** A single belief's confidence
+  may change between two reads as reinforcement or recency drift — by
+  design (it tracks the system's actual current state) but worth knowing.
+- **No JSON export yet.** Your ledger lives in SQLite at the OS app-data
+  path; for now you can `sqlite3` it directly. A versioned JSON export +
+  re-import lands in week 2.
+- **Sycophancy is structurally resisted, not actively detected.** The
+  ledger makes it harder for the AI to flip on a single agreeable response,
+  but there's no per-turn "this answer is over-affirming" signal yet — that
+  research-heavy work is post-launch.
+
+If you find a limitation we haven't surfaced, file an issue.
+
 ## Stack
 
 - **Shell**: Tauri 2 · **Frontend**: Svelte 5 + Vite + Tailwind
