@@ -34,6 +34,18 @@ pub struct ExportEnvelope {
     pub format: String,
     pub meta: ExportMeta,
     pub data: ExportData,
+    /// Optional Ed25519 signature over the canonical bytes of this
+    /// envelope with `signature=None`. Verifier strips the field,
+    /// re-serializes pretty-printed, and checks the resulting bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<EnvelopeSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvelopeSignature {
+    pub algo: String,
+    pub pubkey_hex: String,
+    pub signature_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +171,57 @@ pub fn build_envelope(conn: &Connection, include_embeddings: bool) -> Result<Exp
             include_embeddings,
         },
         data,
+        signature: None,
     })
+}
+
+/// Canonical byte representation used for signing / verifying an
+/// envelope. Strips any existing `signature` field, then pretty-prints.
+/// Pretty-printing is deterministic for serde_json (stable key order
+/// because we use plain structs, no `BTreeMap`), so verifier can rebuild
+/// it bit-for-bit.
+pub fn canonical_bytes(envelope: &ExportEnvelope) -> Result<Vec<u8>> {
+    let mut clone = envelope.clone();
+    clone.signature = None;
+    Ok(serde_json::to_vec_pretty(&clone)?)
+}
+
+/// Attach an Ed25519 signature to an envelope using the local keypair.
+pub fn sign_envelope(envelope: &mut ExportEnvelope, kp: &crate::signing::KeyPair) -> Result<()> {
+    let bytes = canonical_bytes(envelope)?;
+    let signature_hex = kp.sign_message(&bytes);
+    envelope.signature = Some(EnvelopeSignature {
+        algo: "ed25519".into(),
+        pubkey_hex: kp.pubkey_hex(),
+        signature_hex,
+    });
+    Ok(())
+}
+
+/// Verify the envelope's signature (if any) against `expected_pubkey_hex`.
+/// Returns:
+/// - `Ok(true)` if a signature was present and verified;
+/// - `Ok(false)` if no signature was attached;
+/// - `Err(...)` if the signature failed or used the wrong pubkey.
+pub fn verify_envelope_signature(
+    envelope: &ExportEnvelope,
+    expected_pubkey_hex: &str,
+) -> Result<bool> {
+    let Some(sig) = &envelope.signature else {
+        return Ok(false);
+    };
+    if !sig.pubkey_hex.eq_ignore_ascii_case(expected_pubkey_hex) {
+        return Err(anyhow!(
+            "envelope signed by pubkey {} but verifier expects {}",
+            &sig.pubkey_hex[..16.min(sig.pubkey_hex.len())],
+            &expected_pubkey_hex[..16.min(expected_pubkey_hex.len())],
+        ));
+    }
+    let bytes = canonical_bytes(envelope)?;
+    let message = std::str::from_utf8(&bytes)
+        .context("canonical bytes are not valid utf-8 — internal bug")?;
+    crate::signing::verify_message(message, &sig.signature_hex, &sig.pubkey_hex)?;
+    Ok(true)
 }
 
 /// Write the envelope to `path` (pretty-printed JSON), audit-log the
@@ -170,7 +232,34 @@ pub fn export_to_path(
     path: &Path,
     include_embeddings: bool,
 ) -> Result<ExportReport> {
-    let envelope = build_envelope(conn, include_embeddings)?;
+    export_to_path_inner(conn, audit, path, include_embeddings, None)
+}
+
+/// Same as `export_to_path`, but attach an Ed25519 signature using the
+/// passed keypair. The signature is computed over the envelope bytes
+/// *with `signature=None`*, so a verifier can recompute the canonical
+/// form by stripping the signature.
+pub fn export_to_path_signed(
+    conn: &Connection,
+    audit: &AuditDb,
+    path: &Path,
+    include_embeddings: bool,
+    kp: &crate::signing::KeyPair,
+) -> Result<ExportReport> {
+    export_to_path_inner(conn, audit, path, include_embeddings, Some(kp))
+}
+
+fn export_to_path_inner(
+    conn: &Connection,
+    audit: &AuditDb,
+    path: &Path,
+    include_embeddings: bool,
+    sign_with: Option<&crate::signing::KeyPair>,
+) -> Result<ExportReport> {
+    let mut envelope = build_envelope(conn, include_embeddings)?;
+    if let Some(kp) = sign_with {
+        sign_envelope(&mut envelope, kp)?;
+    }
     let json = serde_json::to_string_pretty(&envelope)?;
     std::fs::write(path, &json).with_context(|| format!("write export to {path:?}"))?;
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -205,11 +294,40 @@ pub fn export_to_path(
 /// target connection. `replace=true` clears existing belief data before
 /// the replay; otherwise this errors out unless the target is already
 /// empty. Audit-logs the import.
+///
+/// If `verify_with` is `Some`, an envelope that carries a signature is
+/// verified before any rows are replayed — a bad signature aborts the
+/// import. An unsigned envelope passes through (this is the "I trust
+/// where this file came from" case); callers that want to require a
+/// signature should check `envelope.signature.is_some()` before
+/// invoking.
 pub fn import_from_path(
     conn: &Connection,
     audit: &AuditDb,
     path: &Path,
     replace: bool,
+) -> Result<ImportReport> {
+    import_from_path_inner(conn, audit, path, replace, None)
+}
+
+/// Same as `import_from_path`, but verify any embedded signature
+/// against the local pubkey before replaying.
+pub fn import_from_path_verified(
+    conn: &Connection,
+    audit: &AuditDb,
+    path: &Path,
+    replace: bool,
+    kp: &crate::signing::KeyPair,
+) -> Result<ImportReport> {
+    import_from_path_inner(conn, audit, path, replace, Some(kp))
+}
+
+fn import_from_path_inner(
+    conn: &Connection,
+    audit: &AuditDb,
+    path: &Path,
+    replace: bool,
+    verify_with: Option<&crate::signing::KeyPair>,
 ) -> Result<ImportReport> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {path:?}"))?;
     let envelope: ExportEnvelope = serde_json::from_str(&raw)
@@ -219,6 +337,10 @@ pub fn import_from_path(
             "unsupported export format {:?}, this build expects {EXPORT_FORMAT}",
             envelope.format
         ));
+    }
+    if let Some(kp) = verify_with {
+        verify_envelope_signature(&envelope, &kp.pubkey_hex())
+            .context("envelope signature failed verification — refusing import")?;
     }
 
     // Fail fast if the target isn't empty (unless --replace).
@@ -639,6 +761,44 @@ mod tests {
             let d = base64_decode(&e).unwrap();
             assert_eq!(d, bytes);
         }
+    }
+
+    #[test]
+    fn signed_envelope_round_trip_verifies() {
+        let conn = fresh_conn();
+        seed(&conn, "Anchor belief");
+        let mut env = build_envelope(&conn, false).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kp = crate::signing::KeyPair::load_or_create(tmp.path()).unwrap();
+        sign_envelope(&mut env, &kp).unwrap();
+        assert!(env.signature.is_some());
+        let verified = verify_envelope_signature(&env, &kp.pubkey_hex()).unwrap();
+        assert!(verified, "signed envelope must verify under its own key");
+    }
+
+    #[test]
+    fn signed_envelope_rejects_tampered_data() {
+        let conn = fresh_conn();
+        seed(&conn, "First");
+        let mut env = build_envelope(&conn, false).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kp = crate::signing::KeyPair::load_or_create(tmp.path()).unwrap();
+        sign_envelope(&mut env, &kp).unwrap();
+        // Mutate the envelope data after signing — verifier must catch it.
+        env.meta.belief_count = 99;
+        let err = verify_envelope_signature(&env, &kp.pubkey_hex());
+        assert!(err.is_err(), "tampered envelope must fail signature check");
+    }
+
+    #[test]
+    fn unsigned_envelope_returns_false_not_error() {
+        let conn = fresh_conn();
+        seed(&conn, "Anchor");
+        let env = build_envelope(&conn, false).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kp = crate::signing::KeyPair::load_or_create(tmp.path()).unwrap();
+        let verified = verify_envelope_signature(&env, &kp.pubkey_hex()).unwrap();
+        assert!(!verified, "no signature → returns false, doesn't error");
     }
 
     #[test]

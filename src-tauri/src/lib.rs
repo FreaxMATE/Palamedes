@@ -12,6 +12,7 @@ mod merge;
 mod migrations;
 mod nebius;
 mod recap;
+mod signing;
 mod summarization;
 
 // Streaming chat + retrieval + receipts + embed/label backfill live in
@@ -58,9 +59,12 @@ pub struct AppState {
     client: NebiusClient,
     db: Arc<Db>,
     /// Tamper-evident chain in a separate SQLite file (`audit.db` sibling
-    /// of `palamedes.db`). Survives main-DB corruption; week-4 adds an
-    /// Ed25519 signature over its head.
+    /// of `palamedes.db`). Survives main-DB corruption; week 4 anchors
+    /// it via Ed25519 sigs from `signing`.
     audit: Arc<audit::AuditDb>,
+    /// Local Ed25519 keypair persisted at `<data_dir>/audit-key.{priv,pub}`.
+    /// Used to attest to the audit-chain head and signed export envelopes.
+    signing: Arc<signing::KeyPair>,
     active_streams: Mutex<HashMap<String, CancellationToken>>,
     data_dir: std::path::PathBuf,
     /// MCP server handle when running. None when disabled / stopped.
@@ -1741,6 +1745,51 @@ async fn audit_chain_recent(
     state.audit.recent(n).map_err(|e| e.to_string())
 }
 
+/// The local Ed25519 public key as 64 hex chars. Surface this in the
+/// UI so the user can publish it (a personal site, a git repo) — that's
+/// what pins the chain to a fixed identity.
+#[tauri::command]
+async fn audit_chain_pubkey_hex(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.signing.pubkey_hex())
+}
+
+/// Sign the current chain head with the local Ed25519 key, write
+/// `audit-head.sig` next to `audit.db`, and return the attestation
+/// envelope. `None` if the chain is empty.
+#[tauri::command]
+async fn audit_chain_sign_head(
+    state: State<'_, AppState>,
+) -> Result<Option<signing::SignedHead>, String> {
+    let head = state.audit.head().map_err(|e| e.to_string())?;
+    let Some(head) = head else { return Ok(None) };
+    let signed = state
+        .signing
+        .sign_head(head.seq, &head.event_hash, &head.ts);
+    state
+        .signing
+        .write_head_attestation(&signed)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(signed))
+}
+
+/// Read `audit-head.sig` from disk and verify it against the local
+/// pubkey. Confirms the on-disk attestation matches the key the user
+/// has been advertising.
+#[tauri::command]
+async fn audit_chain_verify_signed_head(
+    state: State<'_, AppState>,
+) -> Result<signing::SignedHead, String> {
+    let path = state.data_dir.join("audit-head.sig");
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        format!("audit-head.sig not found at {} — sign first ({e})", path.display())
+    })?;
+    let signed: signing::SignedHead =
+        serde_json::from_str(&body).map_err(|e| format!("parse audit-head.sig: {e}"))?;
+    signing::verify_signed_head(&signed, &state.signing.pubkey_hex())
+        .map_err(|e| e.to_string())?;
+    Ok(signed)
+}
+
 // ============================================================================
 // JSON ledger export / import.
 // ============================================================================
@@ -1774,6 +1823,46 @@ async fn import_ledger(
     state
         .db
         .with_conn(|conn| export::import_from_path(conn, &audit, &path_buf, replace))
+        .map_err(|e| e.to_string())
+}
+
+/// Write a signed `palamedes.export.v1` envelope to `path`. The local
+/// Ed25519 key attests to the contents — verifier needs only the local
+/// pubkey to confirm bit-for-bit fidelity later.
+#[tauri::command]
+async fn export_ledger_signed(
+    state: State<'_, AppState>,
+    path: String,
+    include_embeddings: bool,
+) -> Result<export::ExportReport, String> {
+    let audit = state.audit.clone();
+    let kp = state.signing.clone();
+    let path_buf = std::path::PathBuf::from(path);
+    state
+        .db
+        .with_conn(|conn| {
+            export::export_to_path_signed(conn, &audit, &path_buf, include_embeddings, &kp)
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Replay an envelope and verify any attached signature against the
+/// local pubkey first. A bad signature aborts the import before any
+/// rows are touched.
+#[tauri::command]
+async fn import_ledger_verified(
+    state: State<'_, AppState>,
+    path: String,
+    replace: bool,
+) -> Result<export::ImportReport, String> {
+    let audit = state.audit.clone();
+    let kp = state.signing.clone();
+    let path_buf = std::path::PathBuf::from(path);
+    state
+        .db
+        .with_conn(|conn| {
+            export::import_from_path_verified(conn, &audit, &path_buf, replace, &kp)
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -1874,6 +1963,10 @@ pub fn run() {
                 audit::AuditDb::open(&audit_path)
                     .expect("failed to open audit chain db"),
             );
+            let signing = Arc::new(
+                signing::KeyPair::load_or_create(&data_dir)
+                    .expect("failed to load/create Ed25519 audit key"),
+            );
 
             // Hold clones for the on-startup recap catch-up task and the
             // MCP auto-start task. Both spawned after `manage` so the main
@@ -1890,6 +1983,7 @@ pub fn run() {
                 client,
                 db,
                 audit,
+                signing,
                 active_streams: Mutex::new(HashMap::new()),
                 data_dir,
                 mcp_server: tokio::sync::Mutex::new(None),
@@ -2022,6 +2116,11 @@ pub fn run() {
             audit_chain_head,
             audit_chain_verify,
             audit_chain_recent,
+            audit_chain_pubkey_hex,
+            audit_chain_sign_head,
+            audit_chain_verify_signed_head,
+            export_ledger_signed,
+            import_ledger_verified,
             export_ledger,
             import_ledger,
         ])
