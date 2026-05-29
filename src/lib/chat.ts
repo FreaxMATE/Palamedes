@@ -573,3 +573,98 @@ export const confirmEmbeddingSwap = () =>
  *  can manually recover later by inspecting vec_beliefs_legacy_<dim>. */
 export const dismissEmbeddingSwap = () =>
   invoke<void>("dismiss_embedding_swap");
+
+// ---------- Audit chain ----------
+
+export interface AuditHead {
+  seq: number;
+  event_hash: string;
+  ts: string;
+}
+
+export interface AuditEntry {
+  seq: number;
+  ts: string;
+  operation: string;
+  actor: string;
+  content_hash: string;
+  prev_hash: string;
+  event_hash: string;
+  metadata: string | null;
+}
+
+export interface VerifyReport {
+  checked: number;
+  ok: boolean;
+  first_failure: [number, string] | null;
+  head: AuditHead | null;
+}
+
+export interface SignedHead {
+  seq: number;
+  event_hash: string;
+  ts: string;
+  head_payload: string;
+  signature_hex: string;
+  pubkey_hex: string;
+}
+
+export const auditChainHead = () =>
+  invoke<AuditHead | null>("audit_chain_head");
+
+export const auditChainVerify = () =>
+  invoke<VerifyReport>("audit_chain_verify");
+
+export const auditChainRecent = (limit?: number) =>
+  invoke<AuditEntry[]>("audit_chain_recent", { limit: limit ?? null });
+
+export const auditChainPubkeyHex = () =>
+  invoke<string>("audit_chain_pubkey_hex");
+
+/** Sign the current chain head and write `<data_dir>/audit-head.sig`.
+ *  Returns null when the chain is empty (no head to sign). */
+export const auditChainSignHead = () =>
+  invoke<SignedHead | null>("audit_chain_sign_head");
+
+/** Read `audit-head.sig` from disk and verify it against the local
+ *  pubkey. Throws if the file is missing or the signature is bad. */
+export const auditChainVerifySignedHead = () =>
+  invoke<SignedHead>("audit_chain_verify_signed_head");
+
+// ---------- Ledger export / import ----------
+
+export interface ExportReport {
+  path: string;
+  bytes: number;
+  belief_count: number;
+  version_count: number;
+  include_embeddings: boolean;
+  audit_seq: number;
+}
+
+export interface ImportReport {
+  belief_count: number;
+  version_count: number;
+  provenance_count: number;
+  merge_count: number;
+  embedding_count: number;
+  audit_seq: number;
+}
+
+export const exportLedger = (path: string, includeEmbeddings: boolean) =>
+  invoke<ExportReport>("export_ledger", { path, includeEmbeddings });
+
+export const importLedger = (path: string, replace: boolean) =>
+  invoke<ImportReport>("import_ledger", { path, replace });
+
+/** Same as `exportLedger` but attaches an Ed25519 signature using the
+ *  local audit key. The verifier needs only the pubkey to confirm
+ *  bit-for-bit fidelity later. */
+export const exportLedgerSigned = (path: string, includeEmbeddings: boolean) =>
+  invoke<ExportReport>("export_ledger_signed", { path, includeEmbeddings });
+
+/** Same as `importLedger` but verifies any embedded signature against
+ *  the local pubkey before replaying. Bad signature aborts before any
+ *  rows are touched. */
+export const importLedgerVerified = (path: string, replace: boolean) =>
+  invoke<ImportReport>("import_ledger_verified", { path, replace });

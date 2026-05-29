@@ -3,7 +3,10 @@
     getSetting, setSetting, wipeChats, wipeAllData,
     mcpStatus, mcpStart, mcpStop, mcpRotateToken,
     mcpListClients, mcpSetConsent, mcpRevokeClient,
+    auditChainHead, auditChainVerify, auditChainPubkeyHex,
+    auditChainSignHead, auditChainVerifySignedHead,
     type McpStatus, type McpClient,
+    type AuditHead, type VerifyReport, type SignedHead,
   } from "./chat";
   import { ensureModels, getCachedModels } from "./modelStore";
   import { onMount } from "svelte";
@@ -15,8 +18,77 @@
 
   let { onClose }: Props = $props();
 
-  type Tab = "general" | "connections";
+  type Tab = "general" | "connections" | "audit";
   let activeTab: Tab = $state("general");
+
+  // Audit chain state
+  let auditHead: AuditHead | null = $state(null);
+  let auditPubkey = $state("");
+  let auditReport: VerifyReport | null = $state(null);
+  let auditSigned: SignedHead | null = $state(null);
+  let auditBusy = $state(false);
+  let auditError: string | null = $state(null);
+  let pubkeyCopied = $state(false);
+
+  async function refreshAudit() {
+    auditBusy = true;
+    auditError = null;
+    try {
+      [auditHead, auditPubkey] = await Promise.all([
+        auditChainHead(),
+        auditChainPubkeyHex(),
+      ]);
+    } catch (e: any) {
+      auditError = e?.message ?? String(e);
+    } finally {
+      auditBusy = false;
+    }
+  }
+
+  async function runAuditVerify() {
+    auditBusy = true;
+    auditError = null;
+    try {
+      auditReport = await auditChainVerify();
+    } catch (e: any) {
+      auditError = e?.message ?? String(e);
+    } finally {
+      auditBusy = false;
+    }
+  }
+
+  async function runAuditSign() {
+    auditBusy = true;
+    auditError = null;
+    try {
+      auditSigned = await auditChainSignHead();
+      auditHead = await auditChainHead();
+    } catch (e: any) {
+      auditError = e?.message ?? String(e);
+    } finally {
+      auditBusy = false;
+    }
+  }
+
+  async function runAuditVerifySigned() {
+    auditBusy = true;
+    auditError = null;
+    try {
+      auditSigned = await auditChainVerifySignedHead();
+    } catch (e: any) {
+      auditError = e?.message ?? String(e);
+    } finally {
+      auditBusy = false;
+    }
+  }
+
+  async function copyPubkey() {
+    try {
+      await navigator.clipboard.writeText(auditPubkey);
+      pubkeyCopied = true;
+      window.setTimeout(() => (pubkeyCopied = false), 1500);
+    } catch {}
+  }
 
   let systemPrompt = $state("");
   let model = $state("");
@@ -187,6 +259,9 @@
     // MCP status — best-effort; the Connections tab handles errors.
     await refreshMcp();
 
+    // Audit chain — also best-effort.
+    await refreshAudit();
+
     // Kick off a refresh in the background (cheap if already cached).
     if (!cached.models) {
       try {
@@ -311,6 +386,16 @@
             title="MCP server is running"
           ></span>
         {/if}
+      </button>
+      <button
+        type="button"
+        onclick={() => (activeTab = "audit")}
+        class="px-3 py-1.5 text-sm font-medium -mb-px border-b-2 transition-colors
+               {activeTab === 'audit'
+                 ? 'pal-accent-text pal-accent-border'
+                 : 'text-neutral-500 border-transparent hover:text-neutral-900 dark:hover:text-neutral-100'}"
+      >
+        Audit
       </button>
     </div>
 
@@ -786,6 +871,129 @@
             </div>
           {/if}
         </div>
+      </div>
+    {:else if loaded && activeTab === "audit"}
+      <div class="space-y-5">
+        <div>
+          <h3 class="text-sm font-semibold mb-1">Audit chain</h3>
+          <p class="text-xs text-neutral-500 mb-3">
+            Every belief write lands as a row in a SHA-256 hash chain in a
+            separate <code>audit.db</code> file. Verifying re-derives every
+            hash top-to-bottom — any in-place tampering falls out.
+          </p>
+
+          <div class="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 text-xs space-y-1.5 font-mono">
+            <div class="flex justify-between gap-2">
+              <span class="text-neutral-500">head seq</span>
+              <span>{auditHead?.seq ?? "—"}</span>
+            </div>
+            <div class="flex justify-between gap-2">
+              <span class="text-neutral-500">event_hash</span>
+              <span class="truncate" title={auditHead?.event_hash}>
+                {auditHead?.event_hash?.slice(0, 16) ?? "—"}…
+              </span>
+            </div>
+            <div class="flex justify-between gap-2">
+              <span class="text-neutral-500">timestamp</span>
+              <span>{auditHead?.ts ?? "—"}</span>
+            </div>
+          </div>
+
+          <div class="flex gap-2 mt-3">
+            <button
+              onclick={runAuditVerify}
+              disabled={auditBusy}
+              class="px-3 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+            >
+              {auditBusy ? "Working…" : "Verify chain integrity"}
+            </button>
+            <button
+              onclick={refreshAudit}
+              disabled={auditBusy}
+              class="px-3 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+            >
+              Refresh
+            </button>
+          </div>
+
+          {#if auditReport}
+            <p
+              class="text-xs mt-2 {auditReport.ok
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : 'text-red-500'}"
+            >
+              {#if auditReport.ok}
+                ✓ {auditReport.checked} rows checked — chain intact.
+              {:else}
+                ✗ failed at seq {auditReport.first_failure?.[0]}:
+                {auditReport.first_failure?.[1]}
+              {/if}
+            </p>
+          {/if}
+        </div>
+
+        <div class="border-t border-neutral-200 dark:border-neutral-800 pt-4">
+          <h3 class="text-sm font-semibold mb-1">Ed25519 attestation</h3>
+          <p class="text-xs text-neutral-500 mb-3">
+            Sign the chain head with your local Ed25519 key. The signature
+            file <code>audit-head.sig</code> is written next to
+            <code>audit.db</code> — publish it anywhere outside the laptop
+            (a personal site, a git repo) to anchor the chain.
+          </p>
+
+          <div class="text-xs space-y-1.5">
+            <div class="text-neutral-500">Local pubkey</div>
+            <div class="flex gap-2">
+              <code
+                class="flex-1 truncate font-mono text-[11px] px-2 py-1.5 rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950"
+                title={auditPubkey}
+              >
+                {auditPubkey || "—"}
+              </code>
+              <button
+                onclick={copyPubkey}
+                disabled={!auditPubkey}
+                class="shrink-0 px-2 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {pubkeyCopied ? "✓ copied" : "Copy"}
+              </button>
+            </div>
+          </div>
+
+          <div class="flex gap-2 mt-3">
+            <button
+              onclick={runAuditSign}
+              disabled={auditBusy || !auditHead}
+              class="px-3 py-1.5 text-xs rounded-md pal-accent-bg hover:opacity-90 text-white disabled:opacity-50"
+            >
+              {auditBusy ? "Signing…" : "Sign current head"}
+            </button>
+            <button
+              onclick={runAuditVerifySigned}
+              disabled={auditBusy}
+              class="px-3 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+            >
+              Verify audit-head.sig
+            </button>
+          </div>
+
+          {#if auditSigned}
+            <p class="text-xs mt-2 text-emerald-600 dark:text-emerald-400">
+              ✓ signed seq {auditSigned.seq} —
+              <span class="font-mono">{auditSigned.signature_hex.slice(0, 16)}…</span>
+            </p>
+          {/if}
+          {#if !auditHead}
+            <p class="text-xs mt-2 text-neutral-500">
+              Chain is empty — perform any write (e.g. accept a belief) before
+              signing.
+            </p>
+          {/if}
+        </div>
+
+        {#if auditError}
+          <p class="text-xs text-red-500">{auditError}</p>
+        {/if}
       </div>
     {:else}
       <p class="text-sm text-neutral-500">Loading…</p>
