@@ -62,6 +62,29 @@ Palamedes is built around. A standalone, language-neutral spec is in
 preparation; for now the canonical reference is the Rust source under
 `src-tauri/src/ledger.rs` and the SQLite schema in `src-tauri/schema.sql`.
 
+## Audit chain
+
+Every write to the belief ledger lands as a row in a tamper-evident
+SHA-256 hash chain stored in a separate SQLite file (`audit.db` next to
+`palamedes.db`). The chain is fully self-verifying — `audit_chain_verify`
+walks it top-to-bottom and re-derives every hash; any in-place edit of
+a past row falls out immediately.
+
+On first launch Palamedes also generates a local Ed25519 keypair at
+`<data_dir>/audit-key.{priv,pub}` (mode 0600). The `audit_chain_sign_head`
+command signs the current head and writes `<data_dir>/audit-head.sig` —
+that file is the portable attestation. Commit it to a public repo, email
+it to yourself, or pin it anywhere outside the laptop, and you've
+anchored the chain to a fixed external point. Export envelopes
+(`export_ledger_signed`) carry the same signature, and
+`import_ledger_verified` refuses any envelope whose signature doesn't
+match the local pubkey.
+
+Threat model: the keypair is local-only — a laptop attacker with full
+disk access can both rewrite `audit.db` *and* re-sign with the key. The
+value is portability: once the signed head leaves the laptop, it
+becomes evidence a later audit can verify against.
+
 ## Known limitations
 
 Audit-grade isn't a finished state — it's a thing you can verify, including
@@ -69,9 +92,9 @@ verifying what *isn't* yet covered. The honest list:
 
 - **MCP consent is bucket-level today.** Granting a client read access lets
   it call every read tool; a per-category ACL (e.g. "preferences but not
-  personal") is on the week-4 roadmap. A per-client 1000-reads/24h rate limit
-  plus a full audit log of every read are already in place; you can see
-  exactly what each connected AI has fetched.
+  personal") is still on the roadmap. A per-client 1000-reads/24h rate
+  limit plus a full audit log of every read are already in place; you can
+  see exactly what each connected AI has fetched.
 - **Embedding-model swaps require a re-embed pass.** If you change the
   embedding model, Palamedes detects it at startup, archives the old vectors
   to `vec_beliefs_legacy_<dim>` so you can roll back, and shows a banner. The
@@ -79,16 +102,10 @@ verifying what *isn't* yet covered. The honest list:
   degrades to empty until that completes.
 - **The UMAP memory map runs client-side.** Fine up to roughly 10k beliefs;
   past that, the initial render gets sluggish. Worker-side projection and
-  delta sync are on the week-5 roadmap.
-- **Extended graph edges (kNN, co-recall) are recomputed on every map open.**
-  The composite index added in week 1 makes this cheap up to ~50k receipts;
-  full materialization lands in week 2.
+  delta sync are still pending.
 - **Confidence is recomputed on every fetch.** A single belief's confidence
   may change between two reads as reinforcement or recency drift — by
   design (it tracks the system's actual current state) but worth knowing.
-- **No JSON export yet.** Your ledger lives in SQLite at the OS app-data
-  path; for now you can `sqlite3` it directly. A versioned JSON export +
-  re-import lands in week 2.
 - **Sycophancy is structurally resisted, not actively detected.** The
   ledger makes it harder for the AI to flip on a single agreeable response,
   but there's no per-turn "this answer is over-affirming" signal yet — that
