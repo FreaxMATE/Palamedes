@@ -500,6 +500,69 @@ async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> 
     state.client.list_models().await.map_err(|e| e.to_string())
 }
 
+// ---------- LLM provider config ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProviderConfig {
+    pub base_url: String,
+    /// Whether an API key is currently configured. The key value itself
+    /// is never returned to the frontend — it's a credential and stays
+    /// in the SQLite settings row.
+    pub api_key_set: bool,
+}
+
+/// Return the currently-configured provider config. The API key value
+/// is masked (only its presence is reported) so a screen-share won't
+/// leak it.
+#[tauri::command]
+fn get_llm_provider(state: State<'_, AppState>) -> Result<LlmProviderConfig, String> {
+    let base_url = state
+        .db
+        .get_setting("llm_base_url")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| nebius::DEFAULT_BASE_URL.to_string());
+    let api_key_set = state
+        .db
+        .get_setting("llm_api_key")
+        .map_err(|e| e.to_string())?
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || std::env::var("LLM_API_KEY").is_ok()
+        || std::env::var("NEBIUS_API_KEY").is_ok();
+    Ok(LlmProviderConfig {
+        base_url,
+        api_key_set,
+    })
+}
+
+/// Save the provider endpoint + API key. The new client is built lazily
+/// on the next app launch — restart is the simplest way to make sure
+/// every in-flight request switches at the same moment.
+///
+/// Pass `api_key = None` to leave the existing key untouched (e.g. when
+/// the user only wants to change the base URL).
+#[tauri::command]
+fn set_llm_provider(
+    state: State<'_, AppState>,
+    base_url: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    if base_url.trim().is_empty() {
+        return Err("base_url must be non-empty".into());
+    }
+    state
+        .db
+        .set_setting("llm_base_url", base_url.trim())
+        .map_err(|e| e.to_string())?;
+    if let Some(key) = api_key {
+        state
+            .db
+            .set_setting("llm_api_key", &key)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---------- structural confidence ----------
 
 /// Build a belief's read-time effective confidence (Beta-posterior score
@@ -883,6 +946,33 @@ fn update_belief(state: State<'_, AppState>, args: UpdateBeliefArgs) -> Result<(
             Ok(())
         })
         .map_err(|e| e.to_string())
+}
+
+// ---------- LLM client construction ----------
+
+/// Build the LLM client from settings, falling back to env vars and
+/// then the default Nebius endpoint. Mirrors the resolution order
+/// documented in [`get_llm_provider`].
+fn build_llm_client(db: &Db) -> anyhow::Result<NebiusClient> {
+    let base_url = db
+        .get_setting("llm_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("LLM_BASE_URL").ok())
+        .unwrap_or_else(|| nebius::DEFAULT_BASE_URL.to_string());
+    let api_key = db
+        .get_setting("llm_api_key")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("LLM_API_KEY").ok())
+        .or_else(|| std::env::var("NEBIUS_API_KEY").ok())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no LLM API key configured — open Settings → Connections and \
+             paste your provider's API key, or set LLM_API_KEY in .env"
+        ))?;
+    Ok(nebius::LlmClient::new(api_key, base_url))
 }
 
 // ---------- capture inbox ----------
@@ -1921,7 +2011,7 @@ pub async fn headless_mcp_serve(data_dir: std::path::PathBuf) -> anyhow::Result<
     let db = Arc::new(Db::open(&db_path)?);
     let audit_path = data_dir.join("audit.db");
     let chain = Arc::new(audit::AuditDb::open(&audit_path)?);
-    let client = NebiusClient::from_env()?;
+    let client = build_llm_client(&db)?;
     let port: u16 = db
         .get_setting("mcp_server_port")?
         .as_deref()
@@ -1947,9 +2037,6 @@ pub fn run() {
     // any Connection::open to take effect.
     embeddings::register_vec_extension();
 
-    let client = NebiusClient::from_env()
-        .expect("failed to init Nebius client — is NEBIUS_API_KEY set in .env?");
-
     tauri::Builder::default()
         .setup(move |app| {
             let data_dir = app
@@ -1958,6 +2045,15 @@ pub fn run() {
                 .expect("no app data dir");
             let db_path = data_dir.join("palamedes.db");
             let db = Arc::new(Db::open(&db_path).expect("failed to open SQLite db"));
+
+            // LLM client — provider is configurable from Settings ➜
+            // Connections. Resolution order: settings table → env vars
+            // (`LLM_API_KEY` / `NEBIUS_API_KEY`, `LLM_BASE_URL`) →
+            // default Nebius endpoint. Any OpenAI-compatible provider
+            // works (OpenAI, OpenRouter, Together, Fireworks, Groq,
+            // Ollama, LM Studio, Anthropic/Google OpenAI-compat
+            // adapters …).
+            let client = build_llm_client(&db).expect("failed to init LLM client");
             let audit_path = data_dir.join("audit.db");
             let audit = Arc::new(
                 audit::AuditDb::open(&audit_path)
@@ -2076,6 +2172,8 @@ pub fn run() {
             get_setting,
             set_setting,
             list_models,
+            get_llm_provider,
+            set_llm_provider,
             list_beliefs_audit,
             get_belief_detail,
             update_belief,

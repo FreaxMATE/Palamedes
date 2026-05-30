@@ -5,8 +5,10 @@
     mcpListClients, mcpSetConsent, mcpRevokeClient,
     auditChainHead, auditChainVerify, auditChainPubkeyHex,
     auditChainSignHead, auditChainVerifySignedHead,
+    getLlmProvider, setLlmProvider, PROVIDER_PRESETS,
     type McpStatus, type McpClient,
     type AuditHead, type VerifyReport, type SignedHead,
+    type LlmProviderConfig, type ProviderPreset,
   } from "./chat";
   import { ensureModels, getCachedModels } from "./modelStore";
   import { onMount } from "svelte";
@@ -100,6 +102,51 @@
   let modelsError: string | null = $state(null);
   let loaded = $state(false);
   let advancedOpen = $state(false);
+
+  // LLM provider state
+  let llm: LlmProviderConfig | null = $state(null);
+  let llmApiKeyInput = $state("");
+  let llmSaving = $state(false);
+  let llmSaveStatus: string | null = $state(null);
+  let selectedPresetId = $state("");
+
+  function presetForUrl(url: string): ProviderPreset | undefined {
+    return PROVIDER_PRESETS.find((p) => p.base_url === url);
+  }
+
+  async function refreshLlm() {
+    try {
+      llm = await getLlmProvider();
+      selectedPresetId = presetForUrl(llm.base_url)?.id ?? "custom";
+    } catch (e: any) {
+      llmSaveStatus = `Failed to load provider: ${e?.message ?? e}`;
+    }
+  }
+
+  function applyPreset(id: string) {
+    selectedPresetId = id;
+    const p = PROVIDER_PRESETS.find((p) => p.id === id);
+    if (p && llm) {
+      llm = { ...llm, base_url: p.base_url };
+    }
+  }
+
+  async function saveLlm() {
+    if (!llm) return;
+    llmSaving = true;
+    llmSaveStatus = null;
+    try {
+      const newKey = llmApiKeyInput.trim() === "" ? null : llmApiKeyInput;
+      await setLlmProvider(llm.base_url, newKey);
+      llmApiKeyInput = "";
+      await refreshLlm();
+      llmSaveStatus = "Saved. Restart Palamedes to use the new provider.";
+    } catch (e: any) {
+      llmSaveStatus = `Failed: ${e?.message ?? e}`;
+    } finally {
+      llmSaving = false;
+    }
+  }
 
   // MCP server state
   let mcp: McpStatus | null = $state(null);
@@ -258,6 +305,9 @@
 
     // MCP status — best-effort; the Connections tab handles errors.
     await refreshMcp();
+
+    // LLM provider — also best-effort.
+    await refreshLlm();
 
     // Audit chain — also best-effort.
     await refreshAudit();
@@ -644,6 +694,83 @@
     {:else if loaded && activeTab === "connections"}
       <div class="space-y-5">
         <div>
+          <h3 class="text-sm font-semibold mb-1">LLM provider</h3>
+          <p class="text-xs text-neutral-500 mb-3">
+            Palamedes works with any OpenAI-compatible endpoint — pick a
+            preset and paste your API key, or set a custom base URL.
+            Changes take effect after restarting the app.
+          </p>
+
+          <label class="block text-xs text-neutral-500 mb-1" for="llm-preset">
+            Preset
+          </label>
+          <select
+            id="llm-preset"
+            value={selectedPresetId}
+            onchange={(e) => applyPreset((e.target as HTMLSelectElement).value)}
+            class="w-full text-sm rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 mb-2"
+          >
+            {#each PROVIDER_PRESETS as p (p.id)}
+              <option value={p.id}>{p.label}</option>
+            {/each}
+            <option value="custom">Custom…</option>
+          </select>
+          {#if selectedPresetId !== "custom"}
+            {@const p = PROVIDER_PRESETS.find((x) => x.id === selectedPresetId)}
+            {#if p?.note}
+              <p class="text-xs text-neutral-500 mb-2">
+                {p.note}
+                <a href={p.signup_url} target="_blank" rel="noopener" class="underline pal-accent-text">Get an API key</a>
+              </p>
+            {/if}
+          {/if}
+
+          <label class="block text-xs text-neutral-500 mb-1" for="llm-base-url">
+            Base URL
+          </label>
+          <input
+            id="llm-base-url"
+            type="text"
+            bind:value={llm!.base_url}
+            oninput={() => {
+              const match = presetForUrl(llm!.base_url);
+              selectedPresetId = match?.id ?? "custom";
+            }}
+            placeholder="https://api.openai.com/v1"
+            class="w-full text-sm font-mono rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 mb-2"
+          />
+
+          <label class="block text-xs text-neutral-500 mb-1" for="llm-api-key">
+            API key
+            {#if llm?.api_key_set && !llmApiKeyInput}
+              <span class="ml-1 text-emerald-600 dark:text-emerald-400">✓ saved</span>
+            {/if}
+          </label>
+          <input
+            id="llm-api-key"
+            type="password"
+            bind:value={llmApiKeyInput}
+            placeholder={llm?.api_key_set ? "•••••••• (leave blank to keep)" : "paste your provider key"}
+            class="w-full text-sm font-mono rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 mb-3"
+          />
+
+          <div class="flex items-center gap-2">
+            <button
+              onclick={saveLlm}
+              disabled={llmSaving || !llm}
+              class="px-3 py-1.5 text-xs rounded-md pal-accent-bg hover:opacity-90 text-white disabled:opacity-50"
+            >
+              {llmSaving ? "Saving…" : "Save provider"}
+            </button>
+            {#if llmSaveStatus}
+              <span class="text-xs {llmSaveStatus.startsWith('Failed') ? 'text-red-500' : 'text-emerald-600 dark:text-emerald-400'}">
+                {llmSaveStatus}
+              </span>
+            {/if}
+          </div>
+        </div>
+
+        <div class="border-t border-neutral-200 dark:border-neutral-800 pt-4">
           <div class="flex items-center justify-between mb-1">
             <h3 class="text-sm font-semibold">MCP server</h3>
             <span
@@ -876,76 +1003,106 @@
       <div class="space-y-5">
         <div>
           <h3 class="text-sm font-semibold mb-1">Audit chain</h3>
-          <p class="text-xs text-neutral-500 mb-3">
-            Every belief write lands as a row in a SHA-256 hash chain in a
-            separate <code>audit.db</code> file. Verifying re-derives every
-            hash top-to-bottom — any in-place tampering falls out.
+          <p class="text-xs pal-dim mb-3 leading-relaxed">
+            Tamper-evident proof that nothing edited your AI's memory behind your
+            back. Each belief Palamedes records is appended to a SHA-256 hash
+            chain in a separate <code>audit.db</code> — every row commits to the
+            one before it, so re-deriving the chain top-to-bottom surfaces any
+            row that was altered, inserted, or deleted after the fact.
           </p>
 
-          <div class="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 text-xs space-y-1.5 font-mono">
-            <div class="flex justify-between gap-2">
-              <span class="text-neutral-500">head seq</span>
-              <span>{auditHead?.seq ?? "—"}</span>
-            </div>
-            <div class="flex justify-between gap-2">
-              <span class="text-neutral-500">event_hash</span>
-              <span class="truncate" title={auditHead?.event_hash}>
-                {auditHead?.event_hash?.slice(0, 16) ?? "—"}…
-              </span>
-            </div>
-            <div class="flex justify-between gap-2">
-              <span class="text-neutral-500">timestamp</span>
-              <span>{auditHead?.ts ?? "—"}</span>
-            </div>
-          </div>
-
-          <div class="flex gap-2 mt-3">
-            <button
-              onclick={runAuditVerify}
-              disabled={auditBusy}
-              class="px-3 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+          {#if auditHead}
+            <div
+              class="text-xs space-y-1.5 font-mono p-3"
+              style="border: 1px solid var(--pal-border); border-radius: var(--pal-radius); background: var(--pal-surface);"
             >
-              {auditBusy ? "Working…" : "Verify chain integrity"}
-            </button>
+              <div class="flex justify-between gap-2">
+                <span class="pal-dim" title="Number of entries in the chain">entries</span>
+                <span>{auditHead.seq}</span>
+              </div>
+              <div class="flex justify-between gap-2">
+                <span class="pal-dim" title="event_hash — the head row's hash, which commits to the entire chain">head fingerprint</span>
+                <span class="truncate" title={auditHead.event_hash}>
+                  {auditHead.event_hash?.slice(0, 16) ?? "—"}…
+                </span>
+              </div>
+              <div class="flex justify-between gap-2">
+                <span class="pal-dim">last write</span>
+                <span>{auditHead.ts ?? "—"}</span>
+              </div>
+            </div>
+
+            <div class="flex gap-2 mt-3">
+              <button
+                onclick={runAuditVerify}
+                disabled={auditBusy}
+                class="px-3 py-1.5 text-xs rounded-md border hover:bg-[var(--pal-bg-sunken)] disabled:opacity-50"
+                style="border-color: var(--pal-border);"
+              >
+                {auditBusy ? "Working…" : "Verify chain integrity"}
+              </button>
+              <button
+                onclick={refreshAudit}
+                disabled={auditBusy}
+                class="px-3 py-1.5 text-xs rounded-md border hover:bg-[var(--pal-bg-sunken)] disabled:opacity-50"
+                style="border-color: var(--pal-border);"
+              >
+                Refresh
+              </button>
+            </div>
+
+            {#if auditReport}
+              <p
+                class="text-xs mt-2 {auditReport.ok
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : 'text-red-500'}"
+              >
+                {#if auditReport.ok}
+                  ✓ {auditReport.checked} rows checked — chain intact.
+                {:else}
+                  ✗ failed at seq {auditReport.first_failure?.[0]}:
+                  {auditReport.first_failure?.[1]}
+                {/if}
+              </p>
+            {/if}
+          {:else}
+            <!-- Empty chain: no dash-filled table, just a plain explanation. -->
+            <div
+              class="text-xs p-3 pal-dim leading-relaxed"
+              style="border: 1px dashed var(--pal-border); border-radius: var(--pal-radius); background: var(--pal-surface);"
+            >
+              The chain is empty — it starts the moment Palamedes records its
+              first belief. Chat for a bit (or accept a belief in the memory
+              ledger), then come back and the head will appear here, ready to
+              verify and sign.
+            </div>
             <button
               onclick={refreshAudit}
               disabled={auditBusy}
-              class="px-3 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              class="mt-3 px-3 py-1.5 text-xs rounded-md border hover:bg-[var(--pal-bg-sunken)] disabled:opacity-50"
+              style="border-color: var(--pal-border);"
             >
               Refresh
             </button>
-          </div>
-
-          {#if auditReport}
-            <p
-              class="text-xs mt-2 {auditReport.ok
-                ? 'text-emerald-600 dark:text-emerald-400'
-                : 'text-red-500'}"
-            >
-              {#if auditReport.ok}
-                ✓ {auditReport.checked} rows checked — chain intact.
-              {:else}
-                ✗ failed at seq {auditReport.first_failure?.[0]}:
-                {auditReport.first_failure?.[1]}
-              {/if}
-            </p>
           {/if}
         </div>
 
-        <div class="border-t border-neutral-200 dark:border-neutral-800 pt-4">
+        <div class="pt-4" style="border-top: 1px solid var(--pal-border);">
           <h3 class="text-sm font-semibold mb-1">Ed25519 attestation</h3>
-          <p class="text-xs text-neutral-500 mb-3">
-            Sign the chain head with your local Ed25519 key. The signature
-            file <code>audit-head.sig</code> is written next to
-            <code>audit.db</code> — publish it anywhere outside the laptop
-            (a personal site, a git repo) to anchor the chain.
+          <p class="text-xs pal-dim mb-3 leading-relaxed">
+            Signing publishes a fingerprint of the chain head so even you can't
+            quietly rewrite history later. The signature file
+            <code>audit-head.sig</code> is written next to <code>audit.db</code>;
+            publish it anywhere off the laptop (a personal site, a git repo) and
+            it anchors the chain to that point in time.
           </p>
 
           <div class="text-xs space-y-1.5">
-            <div class="text-neutral-500">Local pubkey</div>
+            <div class="pal-dim">Local pubkey</div>
             <div class="flex gap-2">
               <code
-                class="flex-1 truncate font-mono text-[11px] px-2 py-1.5 rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950"
+                class="flex-1 truncate font-mono text-[11px] px-2 py-1.5 rounded-md border"
+                style="border-color: var(--pal-border); background: var(--pal-surface);"
                 title={auditPubkey}
               >
                 {auditPubkey || "—"}
@@ -953,7 +1110,8 @@
               <button
                 onclick={copyPubkey}
                 disabled={!auditPubkey}
-                class="shrink-0 px-2 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                class="shrink-0 px-2 py-1.5 text-xs rounded-md border hover:bg-[var(--pal-bg-sunken)] disabled:opacity-50"
+                style="border-color: var(--pal-border);"
               >
                 {pubkeyCopied ? "✓ copied" : "Copy"}
               </button>
@@ -964,6 +1122,7 @@
             <button
               onclick={runAuditSign}
               disabled={auditBusy || !auditHead}
+              title={!auditHead ? "Nothing to sign yet — the chain is empty" : "Sign the current chain head"}
               class="px-3 py-1.5 text-xs rounded-md pal-accent-bg hover:opacity-90 text-white disabled:opacity-50"
             >
               {auditBusy ? "Signing…" : "Sign current head"}
@@ -971,7 +1130,8 @@
             <button
               onclick={runAuditVerifySigned}
               disabled={auditBusy}
-              class="px-3 py-1.5 text-xs rounded-md border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              class="px-3 py-1.5 text-xs rounded-md border hover:bg-[var(--pal-bg-sunken)] disabled:opacity-50"
+              style="border-color: var(--pal-border);"
             >
               Verify audit-head.sig
             </button>
@@ -984,9 +1144,8 @@
             </p>
           {/if}
           {#if !auditHead}
-            <p class="text-xs mt-2 text-neutral-500">
-              Chain is empty — perform any write (e.g. accept a belief) before
-              signing.
+            <p class="text-xs mt-2 pal-dim">
+              Sign is unavailable until the chain has at least one entry.
             </p>
           {/if}
         </div>

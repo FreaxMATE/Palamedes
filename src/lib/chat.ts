@@ -86,6 +86,117 @@ export const setSetting = (key: string, value: string) =>
 
 export const listModels = () => invoke<string[]>("list_models");
 
+// ---------- LLM provider configuration ----------
+
+export interface LlmProviderConfig {
+  base_url: string;
+  /** Whether an API key is currently saved. The actual key value is
+   *  never returned over the IPC bridge — it stays in the settings DB. */
+  api_key_set: boolean;
+}
+
+export const getLlmProvider = () =>
+  invoke<LlmProviderConfig>("get_llm_provider");
+
+/** Save the provider endpoint + API key. Pass `apiKey = null` to leave
+ *  the existing key untouched (e.g. when only changing the base URL).
+ *  The new client takes effect after the next app restart. */
+export const setLlmProvider = (baseUrl: string, apiKey: string | null) =>
+  invoke<void>("set_llm_provider", { baseUrl, apiKey });
+
+/** Curated provider presets. Picking one fills in the base URL; the
+ *  user pastes their API key separately. `model_hint` is informational
+ *  — what name to expect in the model picker once `list_models` runs. */
+export interface ProviderPreset {
+  id: string;
+  label: string;
+  base_url: string;
+  /** Where the user gets a key. */
+  signup_url: string;
+  /** Free-text note shown under the preset (e.g. "covers Claude + Gemini"). */
+  note?: string;
+}
+
+export const PROVIDER_PRESETS: ProviderPreset[] = [
+  {
+    id: "openai",
+    label: "OpenAI (ChatGPT)",
+    base_url: "https://api.openai.com/v1",
+    signup_url: "https://platform.openai.com/api-keys",
+    note: "GPT-4o, GPT-5. Native OpenAI endpoint.",
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic (Claude)",
+    base_url: "https://api.anthropic.com/v1",
+    signup_url: "https://console.anthropic.com/settings/keys",
+    note: "Claude 4.x via Anthropic's OpenAI-compatible adapter.",
+  },
+  {
+    id: "google",
+    label: "Google (Gemini)",
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    signup_url: "https://aistudio.google.com/apikey",
+    note: "Gemini via Google's OpenAI-compatible endpoint.",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    base_url: "https://openrouter.ai/api/v1",
+    signup_url: "https://openrouter.ai/keys",
+    note: "One key, ~200 models — Claude, GPT, Gemini, Llama, Mistral.",
+  },
+  {
+    id: "groq",
+    label: "Groq",
+    base_url: "https://api.groq.com/openai/v1",
+    signup_url: "https://console.groq.com/keys",
+    note: "Very fast Llama, Mixtral, Qwen.",
+  },
+  {
+    id: "cerebras",
+    label: "Cerebras",
+    base_url: "https://api.cerebras.ai/v1",
+    signup_url: "https://cloud.cerebras.ai/platform/",
+    note: "Even faster Llama 3 inference.",
+  },
+  {
+    id: "together",
+    label: "Together AI",
+    base_url: "https://api.together.xyz/v1",
+    signup_url: "https://api.together.xyz/settings/api-keys",
+    note: "Llama 3/4, Mixtral, Qwen, DeepSeek.",
+  },
+  {
+    id: "fireworks",
+    label: "Fireworks",
+    base_url: "https://api.fireworks.ai/inference/v1",
+    signup_url: "https://fireworks.ai/account/api-keys",
+    note: "Llama 3, DeepSeek, Mixtral.",
+  },
+  {
+    id: "nebius",
+    label: "Nebius Token Factory",
+    base_url: "https://api.tokenfactory.nebius.com/v1",
+    signup_url: "https://studio.nebius.ai/",
+    note: "Default. Kimi K2.5, Qwen3-Embedding-8B.",
+  },
+  {
+    id: "ollama",
+    label: "Ollama (local)",
+    base_url: "http://localhost:11434/v1",
+    signup_url: "https://ollama.com/download",
+    note: "Run models locally. No API key needed — use any non-empty placeholder.",
+  },
+  {
+    id: "lmstudio",
+    label: "LM Studio (local)",
+    base_url: "http://localhost:1234/v1",
+    signup_url: "https://lmstudio.ai/",
+    note: "Local GUI for running open models. Use any non-empty placeholder key.",
+  },
+];
+
 // ---------- Belief Ledger / audit ----------
 
 export type BeliefStatus =

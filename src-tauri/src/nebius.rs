@@ -16,7 +16,11 @@ use crate::summarization::{
     build_prompt as build_summary_prompt, parse_response as parse_summary_response, SummarizationContext, SummaryDraft,
 };
 
-const NEBIUS_BASE_URL: &str = "https://api.tokenfactory.nebius.com/v1";
+/// Default endpoint when the user hasn't configured one. Nebius Token
+/// Factory speaks OpenAI-compatible HTTP, so any swap to OpenAI,
+/// OpenRouter, Together, Fireworks, Groq, Ollama, etc. is just a
+/// different base URL + API key from the settings panel.
+pub const DEFAULT_BASE_URL: &str = "https://api.tokenfactory.nebius.com/v1";
 
 /// Small, fast, non-thinking instruct model used for one-shot keyword
 /// extraction (graph labels, cluster names). Hardcoded because it must
@@ -40,11 +44,16 @@ pub struct Message {
 }
 
 #[derive(Clone)]
-pub struct NebiusClient {
+pub struct LlmClient {
     client: Client<OpenAIConfig>,
     api_key: String,
+    base_url: String,
     http: reqwest::Client,
 }
+
+/// Type alias for back-compat with older callers + tests written when the
+/// only supported provider was Nebius. New code should use `LlmClient`.
+pub type NebiusClient = LlmClient;
 
 /// One streaming chunk from the chat endpoint. Either part of the visible
 /// reply (`content`) or part of the model's chain-of-thought (`reasoning`).
@@ -73,25 +82,54 @@ pub struct SummarizationOutcome {
     pub raw_response: String,
 }
 
-impl NebiusClient {
+impl LlmClient {
+    /// Build a client from env vars. Used by binaries that don't open
+    /// the settings DB (e.g. one-off tests); the main app calls
+    /// `build_llm_client(&db)` in `lib.rs` instead.
+    #[allow(dead_code)]
     pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = std::env::var("NEBIUS_API_KEY")
-            .map_err(|_| anyhow::anyhow!("NEBIUS_API_KEY not set (check .env)"))?;
-        Ok(Self::from_api_key(api_key))
+        let api_key = std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("NEBIUS_API_KEY"))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "neither LLM_API_KEY nor NEBIUS_API_KEY is set (check .env)"
+                )
+            })?;
+        let base_url = std::env::var("LLM_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        Ok(Self::new(api_key, base_url))
     }
 
-    /// Construct a client from an explicit API key. Used by tests that
-    /// don't need to hit the network — the API key is required for the
-    /// struct but unused by code paths that don't call out.
+    /// Back-compat shim used by tests that don't need a real endpoint.
+    /// New code should prefer `new` with an explicit base URL.
+    #[allow(dead_code)]
     pub fn from_api_key(api_key: String) -> Self {
+        Self::new(api_key, DEFAULT_BASE_URL.to_string())
+    }
+
+    /// Primary constructor. Accepts any OpenAI-compatible endpoint:
+    /// OpenAI, OpenRouter, Together, Fireworks, Groq, Cerebras, Ollama,
+    /// LM Studio, vLLM, Nebius — and the OpenAI-compatible adapters
+    /// Anthropic and Google offer for Claude / Gemini.
+    pub fn new(api_key: String, base_url: String) -> Self {
         let config = OpenAIConfig::new()
             .with_api_key(api_key.clone())
-            .with_api_base(NEBIUS_BASE_URL);
+            .with_api_base(&base_url);
         Self {
             client: Client::with_config(config),
             api_key,
+            base_url,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Return a clone with a different `(api_key, base_url)` pair. Used
+    /// when the user re-saves their provider settings while the app is
+    /// already running — call sites swap in a new client without
+    /// restarting.
+    #[allow(dead_code)]
+    pub fn with_endpoint(api_key: String, base_url: String) -> Self {
+        Self::new(api_key, base_url)
     }
 
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -134,7 +172,7 @@ impl NebiusClient {
 
         let response = self
             .http
-            .post(format!("{}/chat/completions", NEBIUS_BASE_URL))
+            .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()

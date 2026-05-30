@@ -167,12 +167,37 @@ verifying what *isn't* yet covered. The honest list:
 
 If you find a limitation we haven't surfaced, file an issue.
 
+## Providers — bring your own
+
+Palamedes talks to any OpenAI-compatible HTTP endpoint. Pick a preset in
+**Settings → Connections → LLM provider**, paste your key, restart:
+
+| Provider | Base URL | What you get |
+|---|---|---|
+| **OpenAI (ChatGPT)** | `api.openai.com/v1` | GPT-4o, GPT-5 |
+| **Anthropic (Claude)** | `api.anthropic.com/v1` | Claude 4.x (via Anthropic's OpenAI-compat adapter) |
+| **Google (Gemini)** | `generativelanguage.googleapis.com/v1beta/openai` | Gemini (via Google's OpenAI-compat endpoint) |
+| **OpenRouter** | `openrouter.ai/api/v1` | One key, ~200 models — Claude, GPT, Gemini, Llama, Mistral |
+| **Groq** | `api.groq.com/openai/v1` | Llama, Mixtral, Qwen at very high tok/s |
+| **Cerebras** | `api.cerebras.ai/v1` | Llama 3 at insane speeds |
+| **Together** | `api.together.xyz/v1` | Llama 3/4, Mixtral, Qwen, DeepSeek |
+| **Fireworks** | `api.fireworks.ai/inference/v1` | Llama 3, DeepSeek, Mixtral |
+| **Nebius Token Factory** | `api.tokenfactory.nebius.com/v1` | Default — Kimi K2.5, Qwen3-Embedding-8B |
+| **Ollama** (local) | `localhost:11434/v1` | Anything you've `ollama pull`ed — no key needed |
+| **LM Studio** (local) | `localhost:1234/v1` | GUI for running open models locally |
+| **Custom** | your endpoint | Anything OpenAI-compatible (vLLM, llama-cpp-python, …) |
+
+Embeddings are pulled from the same endpoint, so any provider that ships
+both chat + embeddings (most of the above) works out of the box. For
+chat-only providers (Anthropic, Google) you can configure embeddings to
+hit a different endpoint via the Custom row + the `embedding_model` setting.
+
 ## Stack
 
 - **Shell**: Tauri 2 · **Frontend**: Svelte 5 + Vite + Tailwind
 - **Backend**: Rust (in-process via Tauri commands) · **DB**: SQLite (`rusqlite`)
   + `sqlite-vec`
-- **LLM**: provider-agnostic (Nebius Token Factory / Kimi K2.5 today)
+- **LLM**: provider-agnostic — any OpenAI-compatible endpoint (see above)
 - **MCP**: in-process server exposing the audited corpus to Claude Desktop,
   Cursor, etc.
 
@@ -180,10 +205,15 @@ If you find a limitation we haven't surfaced, file an issue.
 
 ```fish
 direnv allow                     # or: nix develop
-cp .env.example .env             # then paste your Nebius API key
+cp .env.example .env             # set LLM_API_KEY (or NEBIUS_API_KEY) and
+                                 # optionally LLM_BASE_URL for first launch
 pnpm install
 cargo tauri dev
 ```
+
+The provider config lives in the SQLite settings table after first launch
+— the env vars are just bootstrap. Change provider any time from
+Settings → Connections.
 
 ## Acknowledgments
 
