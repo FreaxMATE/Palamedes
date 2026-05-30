@@ -1351,7 +1351,25 @@ pub struct SummarizeReport {
 /// in its own transaction so a single LLM/parse failure can't corrupt the rest.
 #[tauri::command]
 async fn summarize_now(state: State<'_, AppState>) -> Result<SummarizeReport, String> {
-    run_summarize_pass(&state.client, &state.db).await
+    let report = run_summarize_pass(&state.client, &state.db).await?;
+    if report.summaries_created > 0 || report.beliefs_covered > 0 {
+        let meta = serde_json::json!({
+            "categories_processed": report.categories_processed,
+            "summaries_created": report.summaries_created,
+            "beliefs_covered": report.beliefs_covered,
+            "overlaps_dropped": report.overlaps_dropped,
+            "hallucinations_dropped": report.hallucinations_dropped,
+        })
+        .to_string();
+        audit::log_best_effort(
+            &state.audit,
+            "belief.summarize",
+            "user",
+            &format!("summarize:{}", report.summaries_created),
+            Some(&meta),
+        );
+    }
+    Ok(report)
 }
 
 /// Inner body of `summarize_now`, callable from other Tauri commands (e.g.

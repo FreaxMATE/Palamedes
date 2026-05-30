@@ -378,7 +378,22 @@ pub fn merge_beliefs(state: State<'_, AppState>, args: MergeBeliefsArgs) -> Resu
             tx.commit()?;
             Ok(())
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let meta = serde_json::json!({
+        "keeper_id": &args.keeper_id,
+        "absorbed_id": &args.absorbed_id,
+        "kind": "manual",
+        "reason": &args.reason,
+    })
+    .to_string();
+    crate::audit::log_best_effort(
+        &state.audit,
+        "belief.merge",
+        "user",
+        &format!("merge:{}<-{}", args.keeper_id, args.absorbed_id),
+        Some(&meta),
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -671,5 +686,13 @@ pub fn undo_merge(state: State<'_, AppState>, merge_id: String) -> Result<(), St
             undo_merge_in_conn(conn, &merge_id)?;
             Ok(())
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::audit::log_best_effort(
+        &state.audit,
+        "belief.merge.undo",
+        "user",
+        &format!("undo:{}", merge_id),
+        Some(&format!(r#"{{"merge_id":"{merge_id}"}}"#)),
+    );
+    Ok(())
 }
