@@ -46,10 +46,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS universal — one bundle that runs on both architectures.
+          # macOS Apple Silicon. We used to do `universal-apple-darwin` but
+          # that triggers tauri's per-bin lipo, which can't find the helper
+          # binaries (`palamedes-mcp`, `palamedes-mcp-serve`) at the
+          # universal output path — the bundler auto-discovers every
+          # [[bin]] in Cargo.toml but only lipos `default-run`. Two
+          # per-arch jobs sidestep the issue entirely; users download the
+          # .dmg matching their machine.
           - platform: macos-latest
-            args: "--target universal-apple-darwin"
-            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            args: "--target aarch64-apple-darwin"
+            rust-targets: "aarch64-apple-darwin"
+          # macOS Intel. `macos-13` is the last x86_64 runner image GH
+          # Actions still offers; `macos-latest` moved to arm64 in 2026.
+          - platform: macos-13
+            args: "--target x86_64-apple-darwin"
+            rust-targets: "x86_64-apple-darwin"
           # Linux on 22.04 for a broader glibc baseline than the latest
           # ubuntu-latest runner gives us.
           - platform: ubuntu-22.04
