@@ -212,6 +212,7 @@ pub async fn send_message(
     if result.is_ok() && !final_content.trim().is_empty() {
         spawn_extraction(
             state.db.clone(),
+            state.audit.clone(),
             state.client.clone(),
             model.clone(),
             ExtractionSource::Turn(user_msg.id.clone()),

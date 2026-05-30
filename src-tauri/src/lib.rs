@@ -93,6 +93,13 @@ impl ExtractionSource {
             Self::Artifact(_) => SourceType::Artifact,
         }
     }
+    /// Lowercase string form for audit-chain metadata.
+    fn source_type_str(&self) -> &'static str {
+        match self {
+            Self::Turn(_) => "turn",
+            Self::Artifact(_) => "artifact",
+        }
+    }
     /// Only chat turns map cleanly to a `messages` row, so artifact-sourced
     /// extraction logs leave the turn_id NULL.
     fn turn_id_for_log(&self) -> Option<&str> {
@@ -107,8 +114,14 @@ impl ExtractionSource {
 /// propagates errors back to the user — anything that goes wrong is written
 /// to `extraction_log`. Called from `chat_pipeline::send_message` and from
 /// `capture_note` below.
+///
+/// On a successful batch we also append one row to the audit hash chain
+/// summarizing the writes (counts + new belief IDs). One row per batch
+/// rather than per-belief — keeps the chain compact while still letting
+/// the verifier prove every belief existed at sign time.
 pub(crate) fn spawn_extraction(
     db: Arc<Db>,
+    audit_chain: Arc<audit::AuditDb>,
     client: NebiusClient,
     model: String,
     source: ExtractionSource,
@@ -353,6 +366,40 @@ pub(crate) fn spawn_extraction(
                     Some(&summary),
                     None,
                 );
+
+                // Land one row in the tamper-evident audit chain summarizing
+                // this batch — one row per extraction call, not per belief,
+                // so the chain stays compact. Best-effort; an audit-log
+                // failure does not roll back the beliefs we just wrote.
+                if inserted_new > 0 || reinforced > 0 {
+                    let ids: Vec<&str> = new_to_label
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect();
+                    let meta = serde_json::json!({
+                        "source": source.source_type_str(),
+                        "source_id": source.id(),
+                        "inserted_new": inserted_new,
+                        "reinforced": reinforced,
+                        "dropped_blocked_match": dropped_blocked_match,
+                        "unembedded": unembedded,
+                        "new_belief_ids": ids,
+                        "model": &model,
+                    })
+                    .to_string();
+                    let payload = format!(
+                        "extraction:{}+{}",
+                        source.id(),
+                        inserted_new + reinforced
+                    );
+                    audit::log_best_effort(
+                        &audit_chain,
+                        "belief.extraction",
+                        "user",
+                        &payload,
+                        Some(&meta),
+                    );
+                }
 
                 // Fire-and-forget: ask the LLM for a 1–4 word label per new
                 // belief and persist it. Labels are best-effort; a failure
@@ -1010,6 +1057,7 @@ fn capture_note(state: State<'_, AppState>, content: String) -> Result<Artifact,
 
     spawn_extraction(
         state.db.clone(),
+        state.audit.clone(),
         state.client.clone(),
         model,
         ExtractionSource::Artifact(artifact.id.clone()),
