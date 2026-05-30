@@ -943,6 +943,16 @@ pub struct UpdateBeliefArgs {
 
 #[tauri::command]
 fn update_belief(state: State<'_, AppState>, args: UpdateBeliefArgs) -> Result<(), String> {
+    let id_for_audit = args.id.clone();
+    let summary_for_audit = serde_json::json!({
+        "belief_id": &args.id,
+        "new_status": &args.new_status,
+        "new_trust_class": &args.new_trust_class,
+        "statement_changed": args.new_statement.is_some(),
+        "blocklist_added": args.blocklist_pattern.is_some(),
+        "reason": &args.reason,
+    })
+    .to_string();
     state
         .db
         .with_conn(|conn| {
@@ -992,7 +1002,15 @@ fn update_belief(state: State<'_, AppState>, args: UpdateBeliefArgs) -> Result<(
             tx.commit()?;
             Ok(())
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    audit::log_best_effort(
+        &state.audit,
+        "belief.update",
+        "user",
+        &format!("update:{id_for_audit}"),
+        Some(&summary_for_audit),
+    );
+    Ok(())
 }
 
 // ---------- LLM client construction ----------
@@ -1766,6 +1784,30 @@ async fn mcp_accept_proposal(
         .db
         .with_conn_mut(|conn| mcp::proposals::accept_proposal(conn, &proposal_id, override_.clone()))
         .map_err(|e| e.to_string())?;
+
+    // Audit the human approval. External-AI writes that land beliefs in
+    // the ledger flow through here, so this is the row that proves the
+    // user explicitly accepted them — separate from the proposal itself
+    // landing in the inbox.
+    let meta = serde_json::json!({
+        "proposal_id": &proposal_id,
+        "belief_id": &belief_id,
+        "override_statement": override_.as_ref().and_then(|o| o.statement.as_deref()),
+        "override_category": override_.as_ref().and_then(|o| o.category.as_deref()),
+        "override_trust_class": override_
+            .as_ref()
+            .and_then(|o| o.trust_class)
+            .map(|t| t.as_str()),
+    })
+    .to_string();
+    audit::log_best_effort(
+        &state.audit,
+        "proposal.accept",
+        "user",
+        &format!("proposal:{}", &proposal_id),
+        Some(&meta),
+    );
+
     // Kick off embedding for the new belief in the background — the
     // existing embed_unembedded_beliefs path will pick it up on its
     // next sweep too, but doing it now means the next chat turn
