@@ -33,6 +33,60 @@ Palamedes makes the AI's beliefs about you **first-class objects** you own:
 
 Corrections change the next answer, and travel to your other AI tools over MCP.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph In[" "]
+        direction TB
+        chat["💬 Chat turn"]
+        mcp_in["🔌 MCP client<br/><sub>Claude Desktop, Cursor, …</sub>"]
+    end
+
+    extract["🧠 Extraction<br/><sub>LLM emits beliefs +<br/>verbatim evidence quotes</sub>"]
+
+    subgraph Ledger["📚 Belief Ledger (SQLite)"]
+        direction TB
+        beliefs["beliefs · versions ·<br/>provenance · embeddings"]
+        conf["β-distribution<br/>confidence<br/><sub>contradiction × 3</sub>"]
+    end
+
+    subgraph Audit["🔒 Audit chain (audit.db)"]
+        direction TB
+        chain["SHA-256 hash chain<br/><sub>every write linked</sub>"]
+        sig["Ed25519 signature<br/><sub>audit-head.sig</sub>"]
+    end
+
+    inbox["📥 Proposals inbox<br/><sub>user reviews every<br/>external write</sub>"]
+
+    out_export["📦 Signed export<br/><sub>palamedes.export.v1</sub>"]
+    out_anchor["🌍 Publish anchor<br/><sub>git, blog, gist</sub>"]
+
+    chat --> extract --> beliefs
+    mcp_in -- "read tools" --> beliefs
+    mcp_in -- "write tools" --> inbox
+    inbox -. "user approves" .-> beliefs
+    beliefs --> conf
+    beliefs -- "every write" --> chain
+    chain --> sig
+    beliefs --> out_export
+    sig --> out_anchor
+    sig --> out_export
+
+    classDef io fill:#e9f4ff,stroke:#7aa7d9,color:#1c3a5e;
+    classDef proc fill:#fff4e0,stroke:#d4a05c,color:#5e3f1c;
+    classDef store fill:#eef7ed,stroke:#7fb074,color:#2c4f2a;
+    classDef crypto fill:#f3e9ff,stroke:#a07ad4,color:#4a2a6e;
+    class chat,mcp_in,out_anchor,out_export io;
+    class extract,inbox proc;
+    class beliefs,conf store;
+    class chain,sig crypto;
+```
+
+Every box is provable. Click a belief and you see the exact words it was
+extracted from. Verify the chain and you re-derive every hash top to bottom.
+Sign the head and you have a portable attestation no one else can forge.
+
 ## What's different
 
 | | ChatGPT / Claude memory | Mem0 / OpenMemory | Palamedes |
@@ -130,6 +184,56 @@ cp .env.example .env             # then paste your Nebius API key
 pnpm install
 cargo tauri dev
 ```
+
+## Acknowledgments
+
+Palamedes stands on a lot of other people's work. Where ideas were borrowed,
+they're named here in case you want to follow the thread back.
+
+**Prior art that shaped the design (clean-room — no code lifted):**
+
+- **[SuperLocalMemory](https://github.com/Twinkle-Tickling/SuperLocalMemory)** —
+  AGPL-3.0. The Bayesian Beta-distribution trust model for memory entries was
+  the spark for our `confidence.rs`. Different implementation, same intuition:
+  treat reinforcement and contradiction as evidence, not opinion.
+- **[Memori](https://github.com/GibsonAI/memori)** — Apache-2.0. The
+  "SQL-native, inspectable corpus" framing pushed us toward keeping everything
+  in plain SQLite tables you can `jq` and `sqlite3` against, instead of an
+  opaque vector store.
+- **[Khoj](https://github.com/khoj-ai/khoj)** and **[Letta](https://github.com/letta-ai/letta)** —
+  showed that local-first, user-owned memory is a real category, not a niche.
+
+**Standards and protocols:**
+
+- **[Model Context Protocol](https://modelcontextprotocol.io/)** (Anthropic) —
+  the bus that lets Palamedes' Belief Ledger reach Claude Desktop, Cursor,
+  Open WebUI, Witsy, and anything else that speaks MCP.
+- **[rmcp](https://github.com/modelcontextprotocol/rust-sdk)** (Anthropic) —
+  the official Rust SDK that backs our MCP server.
+
+**Research:**
+
+- **["Rewarding Doubt"](https://openreview.net/forum?id=v9bnpqjLZW)** (ICLR 2026)
+  — the case for structural (not self-reported) confidence in language models.
+  Our Beta(α, β) math is one concrete instantiation of that argument.
+- **MIT 2026 personalization → sycophancy finding** — confirmed the failure
+  mode the audit thesis is designed to make harder: an AI that quietly tracks
+  the user's preferences and then quietly flatters them. A ledger you can
+  inspect makes the flattery visible.
+
+**Direct dependencies worth a specific nod:**
+
+- **[sqlite-vec](https://github.com/asg017/sqlite-vec)** — the embeddings index
+  that makes 4096-dim vectors usable inside a 5 MB sqlite file.
+- **[ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek)** —
+  the signing primitive behind the audit chain attestation.
+- **[Tauri](https://tauri.app/)**, **[Svelte](https://svelte.dev/)**,
+  **[rusqlite](https://github.com/rusqlite/rusqlite)** — the desktop / UI /
+  storage backbone.
+
+If we missed your project and you think it should be here, open an issue.
+
+---
 
 Local-first and open source. Your data stays on your machine unless you connect
 it. License: AGPL-3.0.
