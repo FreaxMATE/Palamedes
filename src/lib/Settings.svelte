@@ -280,6 +280,18 @@
     );
   }
 
+  /**
+   * Claude Code (Anthropic's CLI) supports HTTP MCP servers via
+   * `claude mcp add`. We emit the one-liner so the user can paste it
+   * straight into their terminal; no config-file editing needed.
+   */
+  function claudeCodeSnippet(): string {
+    const url = mcp?.url ?? "http://127.0.0.1:5180/mcp";
+    const token = mcp?.token ?? "<token>";
+    return `claude mcp add --transport http palamedes "${url}" \\
+  --header "Authorization: Bearer ${token}"`;
+  }
+
   onMount(async () => {
     // Use cached model list if available — opens instantly.
     const cached = getCachedModels();
@@ -993,6 +1005,20 @@
                     </button>
                   </div>
                   <pre class="text-[11px] rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 p-2 overflow-x-auto font-mono">{claudeDesktopSnippet()}</pre>
+                </div>
+
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs font-medium text-neutral-500">Claude Code (one-liner — paste in any shell)</span>
+                    <button
+                      type="button"
+                      onclick={() => copyToClipboard(claudeCodeSnippet(), "claude-code")}
+                      class="text-xs underline pal-accent-text"
+                    >
+                      {copiedField === "claude-code" ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                  <pre class="text-[11px] rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 p-2 overflow-x-auto font-mono">{claudeCodeSnippet()}</pre>
                 </div>
               </div>
             </div>
